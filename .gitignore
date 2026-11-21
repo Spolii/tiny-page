@@ -1,0 +1,20 @@
+# Build output
+build/
+cmake-build-*/
+out/
+
+# Editor / OS files
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
+
+# Generated at runtime
+crash.log
+
+# Compiled files
+*.exe
+*.o
+*.obj
+*.a
