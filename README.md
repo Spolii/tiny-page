@@ -55,7 +55,7 @@ shared look for every window.
 ### Build and run
 
 ```powershell
-git clone https://github.com/YOUR_USERNAME/tiny-page.git
+git clone https://github.com/Spolii/tiny-page.git
 cd tiny-page
 
 cmake -S . -B build -G "MinGW Makefiles"
