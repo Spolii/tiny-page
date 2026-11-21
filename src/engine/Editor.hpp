@@ -5,6 +5,8 @@
 #include <imgui_impl_sdlrenderer3.h>
 #include <misc/cpp/imgui_stdlib.h>
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <stdexcept>
 #include "Scene.hpp"
@@ -41,6 +43,7 @@ public:
         scene.add("Info",   120,  60, logIcons[0]);
         scene.add("Warning", 200,  90, logIcons[1]);
         scene.add("Error",  120, 130, logIcons[2]);
+        scene.resetHistory();
     }
 
     ~Editor() {
@@ -52,17 +55,12 @@ public:
     void handleEvent(const SDL_Event& e) { ImGui_ImplSDL3_ProcessEvent(&e); }
 
     void frame() {
-        // 1. Draw the scene into the low-res target
-        SDL_SetRenderTarget(r, view);
-        UI::clear(r, {24, 24, 34, 255});
-        scene.draw(r);
-        SDL_SetRenderTarget(r, nullptr);
-
-        // 2. Build the UI
+        // 1. Build the UI
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
+        shortcuts();
         menuBar();
 
         const ImVec2 d      = ImGui::GetIO().DisplaySize;
@@ -77,8 +75,18 @@ public:
         inspector(left + midW, top, right, midH);
         bottomPanel(0, top + midH, d.x, bottom);
 
-        // 3. Draw it
+        // One finished drag / rename / action = one undo step
+        if (!ImGui::IsAnyItemActive()) scene.commitIfChanged();
+
         ImGui::Render();
+
+        // 2. Draw the scene into the low-res target (after the UI, so edits show immediately)
+        SDL_SetRenderTarget(r, view);
+        UI::clear(r, {24, 24, 34, 255});
+        scene.draw(r);
+        SDL_SetRenderTarget(r, nullptr);
+
+        // 3. Draw the UI on top
         UI::clear(r, UI::bg);
         ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), r);
         win.present();
@@ -96,6 +104,19 @@ private:
         return ImGui::Begin(name, nullptr,
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | extra);
+    }
+
+    // Show a "drag sideways" cursor on the last widget
+    static void dragCursor() {
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+    }
+    static void dragFloat(const char* label, float* v, float speed = 1) {
+        ImGui::DragFloat(label, v, speed, 0, 0, "%.1f");
+        dragCursor();
+    }
+    static void dragFloat2(const char* label, float* v, float speed = 1) {
+        ImGui::DragFloat2(label, v, speed, 0, 0, "%.1f");
+        dragCursor();
     }
 
     void applyStyle() {
@@ -138,11 +159,32 @@ private:
         c[ImGuiCol_TabSelected]          = col(UI::button);
     }
 
+    // ---- actions (used by both the shortcuts and the menus) ----
+    void undo() { scene.undo(); renaming = -1; }
+    void redo() { scene.redo(); renaming = -1; }
+    void deleteSelected() { scene.removeSelected(); renaming = -1; }
+
+    void shortcuts() {
+        const ImGuiIO& io = ImGui::GetIO();
+        if (io.WantTextInput) return;   // typing in a text box: leave the keys alone
+
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) io.KeyShift ? redo() : undo();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) redo();
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete)) deleteSelected();
+    }
+
     void menuBar() {
         if (!ImGui::BeginMainMenuBar()) return;
 
         if (ImGui::BeginMenu("File")) {
             if (ImGui::MenuItem("Exit")) wantsQuit = true;
+            ImGui::EndMenu();
+        }
+        if (ImGui::BeginMenu("Edit")) {
+            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, scene.canUndo())) undo();
+            if (ImGui::MenuItem("Redo", "Ctrl+Y", false, scene.canRedo())) redo();
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete", "Del", false, scene.hasSelection())) deleteSelected();
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Scene")) {
@@ -167,8 +209,19 @@ private:
     void hierarchy(float x, float y, float w, float h) {
         if (panel("Hierarchy", x, y, w, h)) {
             for (int i = 0; i < int(scene.entities.size()); ++i) {
+                Entity& e = scene.entities[i];
                 ImGui::PushID(i);
-                if (ImGui::Selectable(scene.entities[i].name.c_str(), scene.selected == i)) scene.selected = i;
+                if (renaming == i) {
+                    if (renameFocus) { ImGui::SetKeyboardFocusHere(); renameFocus = false; }
+                    ImGui::SetNextItemWidth(-FLT_MIN);
+                    ImGui::InputText("##rename", &e.name,
+                        ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+                    if (ImGui::IsItemDeactivated()) renaming = -1;   // Enter, Esc or click away
+                } else if (ImGui::Selectable(e.name.c_str(), scene.selected == i,
+                                             ImGuiSelectableFlags_AllowDoubleClick)) {
+                    scene.selected = i;
+                    if (ImGui::IsMouseDoubleClicked(0)) { renaming = i; renameFocus = true; }
+                }
                 ImGui::PopID();
             }
         }
@@ -183,9 +236,39 @@ private:
             const ImVec2 pos = ImGui::GetCursorPos();
             ImGui::SetCursorPos({pos.x + std::max(0.f, (avail.x - size.x) / 2),
                                  pos.y + std::max(0.f, (avail.y - size.y) / 2)});
+
+            const ImVec2 origin = ImGui::GetCursorScreenPos();
             ImGui::Image(tid(view), size);
+            ImGui::SetCursorScreenPos(origin);
+            ImGui::InvisibleButton("viewport", size);
+            dragInScene(origin, float(s));
         }
         ImGui::End();
+    }
+
+    // Click to select, drag to move (call right after the viewport's InvisibleButton)
+    void dragInScene(ImVec2 origin, float s) {
+        const ImVec2 m  = ImGui::GetMousePos();
+        const float  mx = (m.x - origin.x) / s;
+        const float  my = (m.y - origin.y) / s;
+
+        if (ImGui::IsItemActivated()) {
+            scene.selected = scene.pick(mx, my);
+            dragging       = scene.hasSelection();
+            if (dragging) {
+                grabX = mx - scene.entities[scene.selected].x;
+                grabY = my - scene.entities[scene.selected].y;
+            }
+        }
+        if (!ImGui::IsItemActive()) dragging = false;
+
+        if (dragging) {
+            Entity& e = scene.entities[scene.selected];
+            e.x = std::round(mx - grabX);
+            e.y = std::round(my - grabY);
+        }
+        if (dragging || (ImGui::IsItemHovered() && scene.pick(mx, my) >= 0))
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
     }
 
     void inspector(float x, float y, float w, float h) {
@@ -193,12 +276,10 @@ private:
             if (scene.hasSelection()) {
                 Entity& e = scene.entities[scene.selected];
                 ImGui::InputText("Name", &e.name);
-                ImGui::DragFloat2("Position", &e.x, 1.0f);
+                dragFloat2("Position", &e.x);
+                dragFloat("Rotation", &e.rotation);
                 ImGui::Separator();
-                if (ImGui::Button("Delete")) {
-                    scene.entities.erase(scene.entities.begin() + scene.selected);
-                    scene.selected = -1;
-                }
+                if (ImGui::Button("Delete")) deleteSelected();
             } else {
                 ImGui::TextDisabled("Nothing selected");
             }
@@ -241,9 +322,14 @@ private:
 
     Window&       win;
     SDL_Renderer* r;
-    SDL_Texture*  view       = nullptr;
+    SDL_Texture*  view        = nullptr;
     SDL_Texture*  logIcons[3] = {};
-    SDL_Texture*  spriteIcon = nullptr;
+    SDL_Texture*  spriteIcon  = nullptr;
     Scene         scene;
     size_t        lastLogCount = 0;
+
+    int   renaming    = -1;      // Hierarchy row being renamed
+    bool  renameFocus = false;
+    bool  dragging    = false;   // dragging a sprite in the Scene view
+    float grabX = 0, grabY = 0;
 };
