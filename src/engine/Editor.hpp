@@ -31,9 +31,6 @@ public:
         ImGui_ImplSDL3_InitForSDLRenderer(w.window, r);
         ImGui_ImplSDLRenderer3_Init(r);
 
-        view = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, viewW, viewH);
-        SDL_SetTextureScaleMode(view, SDL_SCALEMODE_NEAREST);
-
         logIcons[0] = loadTexture(r, "info.png");
         logIcons[1] = loadTexture(r, "warning.png");
         logIcons[2] = loadTexture(r, "error.png");
@@ -80,11 +77,13 @@ public:
 
         ImGui::Render();
 
-        // 2. Draw the scene into the low-res target (after the UI, so edits show immediately)
-        SDL_SetRenderTarget(r, view);
-        UI::clear(r, {24, 24, 34, 255});
-        scene.draw(r);
-        SDL_SetRenderTarget(r, nullptr);
+        // 2. Draw the scene at the size it is shown (after the UI, so edits show immediately)
+        if (view) {
+            SDL_SetRenderTarget(r, view);
+            UI::clear(r, {24, 24, 34, 255});
+            scene.draw(r, float(viewScale));
+            SDL_SetRenderTarget(r, nullptr);
+        }
 
         // 3. Draw the UI on top
         UI::clear(r, UI::bg);
@@ -93,7 +92,7 @@ public:
     }
 
 private:
-    static constexpr int viewW = 320, viewH = 180;
+    static constexpr int viewW = 320, viewH = 180;   // scene size in scene units
 
     static ImVec4 col(SDL_Color c, float a = 1) { return {c.r / 255.f, c.g / 255.f, c.b / 255.f, a}; }
     static ImTextureID tid(SDL_Texture* t) { return (ImTextureID)(intptr_t)t; }
@@ -157,6 +156,15 @@ private:
         c[ImGuiCol_Tab]                  = col(UI::bg);
         c[ImGuiCol_TabHovered]           = col(UI::accent, 0.60f);
         c[ImGuiCol_TabSelected]          = col(UI::button);
+    }
+
+    // The scene texture is viewW*s by viewH*s pixels, so it is shown 1:1 (no resampling)
+    void ensureView(int s) {
+        if (view && s == viewScale) return;
+        if (view) SDL_DestroyTexture(view);
+        view = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, viewW * s, viewH * s);
+        SDL_SetTextureScaleMode(view, SDL_SCALEMODE_NEAREST);
+        viewScale = s;
     }
 
     // ---- actions (used by both the shortcuts and the menus) ----
@@ -232,6 +240,8 @@ private:
         if (panel("Scene", x, y, w, h, ImGuiWindowFlags_NoScrollbar)) {
             const ImVec2 avail = ImGui::GetContentRegionAvail();
             const int    s     = std::max(1, int(std::min(avail.x / viewW, avail.y / viewH)));
+            ensureView(s);
+
             const ImVec2 size(float(viewW * s), float(viewH * s));
             const ImVec2 pos = ImGui::GetCursorPos();
             ImGui::SetCursorPos({pos.x + std::max(0.f, (avail.x - size.x) / 2),
@@ -323,6 +333,7 @@ private:
     Window&       win;
     SDL_Renderer* r;
     SDL_Texture*  view        = nullptr;
+    int           viewScale   = 0;
     SDL_Texture*  logIcons[3] = {};
     SDL_Texture*  spriteIcon  = nullptr;
     Scene         scene;
