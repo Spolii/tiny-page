@@ -4,7 +4,7 @@
 
 # tiny-page
 
-**A tiny, pixel-perfect 2D game engine and editor written in C++20.**
+**A tiny, pixel-perfect 2D game engine and editor written in C++.**
 
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-42A5F5?style=flat-square&logo=cplusplus&logoColor=white)
 ![SDL3](https://img.shields.io/badge/SDL-3-42A5F5?style=flat-square)
