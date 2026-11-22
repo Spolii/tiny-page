@@ -10,6 +10,7 @@
 #include <shellapi.h>
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <filesystem>
 #include <set>
 #include <sstream>
@@ -23,14 +24,16 @@
 
 namespace fs = std::filesystem;
 
+// A file in project/assets: a PNG sprite (has a texture) or a Lua script (no texture)
 struct Asset {
     std::string         name;   // path inside project/assets, e.g. "icon.png"
     SDL_Texture*        texture = nullptr;
+    bool                script  = false;
     bool                smooth  = false;
     fs::file_time_type  stamp{};
 };
 
-// Every PNG in project/assets, loaded as a texture. Entities refer to assets by name.
+// Entities refer to assets by name.
 // Call refresh() only outside the UI build (it can replace textures).
 class AssetStore {
 public:
@@ -67,11 +70,11 @@ public:
         saveFilters();
     }
 
-    // Copy a PNG into the project; call refresh() afterwards
+    // Copy a PNG or Lua file into the project; call refresh() afterwards
     bool importFile(const std::string& path) {
         const fs::path src(path);
-        if (!isPng(src)) {
-            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Import skipped, only PNG files are supported: %s", path.c_str());
+        if (!hasExt(src, ".png") && !hasExt(src, ".lua")) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Import skipped, only PNG and Lua files are supported: %s", path.c_str());
             return false;
         }
         std::error_code ec;
@@ -82,6 +85,27 @@ public:
         }
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Imported %s", src.filename().string().c_str());
         return true;
+    }
+
+    // Create a new script from a template and return its name; call refresh() afterwards
+    std::string createScript() {
+        std::error_code ec;
+        for (int n = 0; n < 1000; ++n) {
+            const std::string name = n == 0 ? "NewScript.lua" : "NewScript" + std::to_string(n) + ".lua";
+            if (fs::exists(dir() / name, ec)) continue;
+            SDL_SaveFile((dir() / name).string().c_str(), scriptTemplate, std::strlen(scriptTemplate));
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Created %s", name.c_str());
+            return name;
+        }
+        return {};
+    }
+
+    // Open a file with the app Windows has chosen for it
+    void open(const std::string& name) const {
+        const std::string path = (dir() / name).make_preferred().string();
+        const auto result = reinterpret_cast<INT_PTR>(
+            ShellExecuteA(nullptr, "open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+        if (result <= 32) SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Could not open %s", name.c_str());
     }
 
     // Move the file to the Recycle Bin; call refresh() afterwards
@@ -108,7 +132,7 @@ public:
         std::error_code ec;
         std::vector<std::pair<std::string, fs::file_time_type>> found;
         for (const auto& f : fs::recursive_directory_iterator(dir(), ec)) {
-            if (!f.is_regular_file(ec) || !isPng(f.path())) continue;
+            if (!f.is_regular_file(ec) || !(hasExt(f.path(), ".png") || hasExt(f.path(), ".lua"))) continue;
             found.emplace_back(fs::relative(f.path(), dir(), ec).generic_string(), f.last_write_time(ec));
         }
 
@@ -116,7 +140,7 @@ public:
             const bool exists = std::any_of(found.begin(), found.end(),
                                             [&](const auto& f) { return f.first == it->name; });
             if (exists) { ++it; continue; }
-            SDL_DestroyTexture(it->texture);
+            if (it->texture) SDL_DestroyTexture(it->texture);
             it = assets.erase(it);
         }
 
@@ -125,31 +149,50 @@ public:
             for (Asset& x : assets) if (x.name == name) a = &x;
             if (a && a->stamp == stamp) continue;
 
-            SDL_Texture* tex = loadTextureFile(renderer, (dir() / name).string());
-            if (!tex) continue;
+            const bool   isScript = hasExt(name, ".lua");
+            SDL_Texture* tex      = nullptr;
+            if (!isScript) {
+                tex = loadTextureFile(renderer, (dir() / name).string());
+                if (!tex) continue;
+            }
+
             if (a) {
-                SDL_DestroyTexture(a->texture);
+                if (a->texture) SDL_DestroyTexture(a->texture);
             } else {
                 assets.push_back({});
                 a = &assets.back();
-                a->name = name;
+                a->name   = name;
+                a->script = isScript;
             }
             a->texture = tex;
             a->stamp   = stamp;
-            applyFilter(*a);
+            if (tex) applyFilter(*a);
         }
 
         std::sort(assets.begin(), assets.end(), [](const Asset& a, const Asset& b) { return a.name < b.name; });
     }
 
 private:
+    static constexpr const char* scriptTemplate =
+        "-- self has: x, y, rotation, scale_x, scale_y, name\n"
+        "-- helpers: log(\"text\"), key_down(\"Left\")\n"
+        "\n"
+        "-- Runs once when Play starts\n"
+        "function start(self)\n"
+        "end\n"
+        "\n"
+        "-- Runs every frame while playing. dt = seconds since the last frame\n"
+        "function update(self, dt)\n"
+        "    self.rotation = self.rotation + 90 * dt\n"
+        "end\n";
+
     static fs::path dir()         { return fs::path(PROJECT_DIR) / "assets"; }
     static fs::path filtersFile() { return fs::path(PROJECT_DIR) / "filters.txt"; }
 
-    static bool isPng(const fs::path& p) {
+    static bool hasExt(const fs::path& p, const char* ext) {
         std::string e = p.extension().string();
         std::transform(e.begin(), e.end(), e.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-        return e == ".png";
+        return e == ext;
     }
 
     void applyFilter(Asset& a) {

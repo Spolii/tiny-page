@@ -9,9 +9,12 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 #include <utility>
+#include <vector>
 #include "AssetStore.hpp"
 #include "Scene.hpp"
+#include "Scripting.hpp"
 #include "core/Assets.hpp"
 #include "core/Log.hpp"
 #include "core/UI.hpp"
@@ -49,6 +52,7 @@ public:
     }
 
     ~Editor() {
+        scripting.stop();
         ImGui_ImplSDLRenderer3_Shutdown();
         ImGui_ImplSDL3_Shutdown();
         ImGui::DestroyContext();
@@ -72,6 +76,12 @@ public:
             assets.refresh();
             refreshAssets = false;
         }
+
+        // Run the scripts
+        const Uint64 now = SDL_GetTicksNS();
+        const float  dt  = lastTicks ? std::min(float(now - lastTicks) / 1e9f, 0.1f) : 0.0f;
+        lastTicks = now;
+        if (mode == Mode::Playing) scripting.update(scene, dt);
 
         assetsFocusedLast = assetsFocused;   // so Delete knows what you clicked last
         assetsFocused     = false;
@@ -97,7 +107,7 @@ public:
         bottomPanel(0, top + midH, d.x, bottom);
         deleteAssetDialog();
 
-        // One finished drag / rename / action = one undo step
+        // One finished drag / rename / action = one undo step (not recorded while playing)
         if (!ImGui::IsAnyItemActive()) scene.commitIfChanged();
 
         ImGui::Render();
@@ -117,6 +127,10 @@ public:
     }
 
 private:
+    enum class Mode { Stopped, Playing, Paused };
+    enum class Drag { None, Move, Marquee };
+    enum class Icon { Play, Pause, Stop, Lock, Unlock };
+
     static constexpr int viewW = 320, viewH = 180;   // scene size in scene units
 
     // Context menus: a popup's mouse button is part of its flags and 0 means LEFT,
@@ -150,6 +164,63 @@ private:
         const bool changed = ImGui::DragFloat2(label, v, speed, min, max, fmt);
         dragCursor();
         return changed;
+    }
+
+    // A square button with a small pixel icon (play, pause, stop, lock)
+    static bool iconButton(const char* id, Icon icon, bool active = false, bool enabled = true,
+                           const char* tip = nullptr) {
+        const float s = ImGui::GetFrameHeight();
+        ImGui::BeginDisabled(!enabled);
+        const bool clicked = ImGui::InvisibleButton(id, {s, s});
+        ImGui::EndDisabled();
+        const bool hovered = ImGui::IsItemHovered();
+        if (tip && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled | ImGuiHoveredFlags_ForTooltip))
+            ImGui::SetTooltip("%s", tip);
+
+        const ImVec2 p0 = ImGui::GetItemRectMin(), p1 = ImGui::GetItemRectMax();
+        ImDrawList*  dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(col(active ? UI::accent : hovered ? UI::buttonHover : UI::button)));
+        dl->AddRect(p0, p1, ImGui::GetColorU32(col(UI::border)));
+
+        const ImU32 ink = ImGui::GetColorU32(col(active ? UI::panel : enabled ? UI::fg : UI::dim));
+        const int   h   = std::max(3, int(s * 0.2f));   // half the glyph size, in pixels
+        const float cx  = std::floor((p0.x + p1.x) / 2), cy = std::floor((p0.y + p1.y) / 2);
+        auto box = [&](float x0, float y0, float x1, float y1) {
+            dl->AddRectFilled({cx + x0, cy + y0}, {cx + x1, cy + y1}, ink);
+        };
+
+        switch (icon) {
+        case Icon::Stop:
+            box(-h, -h, h, h);
+            break;
+        case Icon::Pause: {
+            const int w = std::max(2, h * 2 / 3);
+            box(-h, -h, -h + w, h);
+            box(h - w, -h, h, h);
+            break;
+        }
+        case Icon::Play: {
+            const int n = h + h / 2 + 1;   // a triangle made of 1-pixel columns
+            for (int i = 0; i < n; ++i) {
+                const float half = std::round(h * (1.0f - i / float(n)));
+                box(float(-n / 2 + i), -half, float(-n / 2 + i + 1), half);
+            }
+            break;
+        }
+        case Icon::Lock:
+            box(-h, 0, h, h);                    // body
+            box(-h + 1, -h, -h + 2, 0);          // closed shackle
+            box(h - 2, -h, h - 1, 0);
+            box(-h + 1, -h, h - 1, -h + 1);
+            break;
+        case Icon::Unlock:
+            box(-h, 0, h, h);                    // body
+            box(-h + 1, -h - 2, -h + 2, 0);      // open shackle
+            box(-h + 1, -h - 2, h - 1, -h - 1);
+            box(h - 2, -h - 2, h - 1, -h + 1);
+            break;
+        }
+        return clicked;
     }
 
     // Shorten a name with ".." so it fits in `width` pixels
@@ -209,13 +280,39 @@ private:
         viewScale = s;
     }
 
+    // ---- play mode ----
+    // While playing, scripts own the objects: adding, deleting, reordering and undo are off.
+    bool editing() const { return mode == Mode::Stopped; }
+
+    void play() {
+        if (mode == Mode::Paused) { mode = Mode::Playing; return; }
+        if (mode != Mode::Stopped) return;
+        scene.beginPlay();
+        mode     = Mode::Playing;
+        renaming = -1;
+        scripting.start(scene, assets.folder());
+    }
+
+    void pause() {
+        if (mode == Mode::Playing)     mode = Mode::Paused;
+        else if (mode == Mode::Paused) mode = Mode::Playing;
+    }
+
+    void stop() {
+        if (mode == Mode::Stopped) return;
+        scripting.stop();
+        scene.endPlay();
+        mode     = Mode::Stopped;
+        renaming = -1;
+    }
+
     // ---- actions (shared by shortcuts, menu bar and right-click menus) ----
-    void undo()              { scene.undo(); renaming = -1; }
-    void redo()              { scene.redo(); renaming = -1; }
-    void deleteSelected()    { scene.removeSelected(); renaming = -1; }
-    void duplicateSelected() { scene.duplicateSelected(); renaming = -1; }
-    void bringToFront()      { scene.bringToFront(); renaming = -1; }
-    void sendToBack()        { scene.sendToBack(); renaming = -1; }
+    void undo()              { if (editing()) { scene.undo(); renaming = -1; } }
+    void redo()              { if (editing()) { scene.redo(); renaming = -1; } }
+    void deleteSelected()    { if (editing()) { scene.removeSelected(); renaming = -1; } }
+    void duplicateSelected() { if (editing()) { scene.duplicateSelected(); renaming = -1; } }
+    void bringToFront()      { if (editing()) { scene.bringToFront(); renaming = -1; } }
+    void sendToBack()        { if (editing()) { scene.sendToBack(); renaming = -1; } }
 
     void startRename() {
         if (!scene.hasSelection()) return;
@@ -230,6 +327,7 @@ private:
 
     // `sprite` is an asset name; empty = an object without a sprite. x, y = center.
     void addObject(float x, float y, const std::string& sprite = {}) {
+        if (!editing()) return;
         const std::string name = sprite.empty() ? "Object" : fs::path(sprite).stem().string();
         scene.add(name, std::round(x), std::round(y), sprite);
         scene.select(int(scene.entities.size()) - 1);
@@ -246,13 +344,15 @@ private:
 
     // The one menu every right-click on an object uses
     void entityMenu() {
-        if (ImGui::MenuItem("Rename", "F2"))        startRename();
+        if (ImGui::MenuItem("Rename", "F2")) startRename();
+        ImGui::BeginDisabled(!editing());
         if (ImGui::MenuItem("Duplicate", "Ctrl+D")) duplicateSelected();
         ImGui::Separator();
-        if (ImGui::MenuItem("Bring to Front"))      bringToFront();
-        if (ImGui::MenuItem("Send to Back"))        sendToBack();
+        if (ImGui::MenuItem("Bring to Front")) bringToFront();
+        if (ImGui::MenuItem("Send to Back"))   sendToBack();
         ImGui::Separator();
-        if (ImGui::MenuItem("Delete", "Del"))       deleteSelected();
+        if (ImGui::MenuItem("Delete", "Del"))  deleteSelected();
+        ImGui::EndDisabled();
     }
 
     void shortcuts() {
@@ -284,12 +384,12 @@ private:
             if (ImGui::MenuItem("Redo", "Ctrl+Y", false, scene.canRedo())) redo();
             ImGui::Separator();
             if (ImGui::MenuItem("Select All", "Ctrl+A")) scene.selectAll();
-            if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, scene.hasSelection())) duplicateSelected();
-            if (ImGui::MenuItem("Delete", "Del", false, scene.hasSelection())) deleteSelected();
+            if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, editing() && scene.hasSelection())) duplicateSelected();
+            if (ImGui::MenuItem("Delete", "Del", false, editing() && scene.hasSelection())) deleteSelected();
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Scene")) {
-            if (ImGui::MenuItem("Add Object")) addObjectAtCenter();
+            if (ImGui::MenuItem("Add Object", nullptr, false, editing())) addObjectAtCenter();
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Debug")) {
@@ -344,15 +444,30 @@ private:
             }
 
             if (ImGui::BeginPopupContextWindow("hierarchyMenu", rightClickEmpty)) {
-                if (ImGui::MenuItem("Add Object")) addObjectAtCenter();
+                if (ImGui::MenuItem("Add Object", nullptr, false, editing())) addObjectAtCenter();
                 ImGui::EndPopup();
             }
         }
         ImGui::End();
     }
 
+    // Play / Pause / Stop, centered at the top of the Scene panel
+    void toolbar() {
+        const float s   = ImGui::GetFrameHeight();
+        const float gap = ImGui::GetStyle().ItemSpacing.x;
+        ImGui::SetCursorPosX(std::max(0.0f, (ImGui::GetWindowWidth() - (3 * s + 2 * gap)) / 2));
+
+        if (iconButton("play", Icon::Play, mode == Mode::Playing, true, "Play")) play();
+        ImGui::SameLine();
+        if (iconButton("pause", Icon::Pause, mode == Mode::Paused, mode != Mode::Stopped, "Pause")) pause();
+        ImGui::SameLine();
+        if (iconButton("stop", Icon::Stop, false, mode != Mode::Stopped, "Stop")) stop();
+    }
+
     void sceneView(float x, float y, float w, float h) {
         if (panel("Scene", x, y, w, h, ImGuiWindowFlags_NoScrollbar)) {
+            toolbar();
+
             const ImVec2 avail = ImGui::GetContentRegionAvail();
             const int    s     = std::max(1, int(std::min(avail.x / viewW, avail.y / viewH)));
             ensureView(s);
@@ -364,6 +479,10 @@ private:
 
             const ImVec2 origin = ImGui::GetCursorScreenPos();
             ImGui::Image(tid(view), size);
+            if (mode != Mode::Stopped)   // a colored frame while playing / paused
+                ImGui::GetWindowDrawList()->AddRect(origin, {origin.x + size.x, origin.y + size.y},
+                    ImGui::GetColorU32(col(mode == Mode::Paused ? UI::warn : UI::accent)), 0.0f, 0, 3.0f);
+
             ImGui::SetCursorScreenPos(origin);
             ImGui::InvisibleButton("viewport", size);
             dragInScene(origin, float(s));
@@ -432,10 +551,10 @@ private:
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
     }
 
-    // An asset dropped on the Scene becomes an object under the mouse
+    // A sprite dropped on the Scene becomes an object under the mouse
     void sceneDrop(ImVec2 origin, float s) {
         if (!ImGui::BeginDragDropTarget()) return;
-        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ASSET")) {
+        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("SPRITE")) {
             const ImVec2 m = ImGui::GetMousePos();
             addObject((m.x - origin.x) / s, (m.y - origin.y) / s, static_cast<const char*>(p->Data));
         }
@@ -455,24 +574,28 @@ private:
         }
         if (ImGui::BeginPopupContextItem("sceneMenu", rightClick)) {
             if (scene.hasSelection()) entityMenu();
-            else if (ImGui::MenuItem("Add Object")) addObject(clickX, clickY);
+            else if (ImGui::MenuItem("Add Object", nullptr, false, editing())) addObject(clickX, clickY);
             ImGui::EndPopup();
         }
     }
 
-    // Pick an asset from a list, or drop one from the Assets panel. Returns true when it changed.
-    bool spriteField(Entity& e) {
+    // Pick a sprite (or script) from a list, or drop one from the Assets panel.
+    // Returns true when it changed.
+    bool assetField(const char* label, std::string& value, bool scripts) {
         bool changed = false;
-        if (ImGui::BeginCombo("Sprite", e.sprite.empty() ? "None" : e.sprite.c_str())) {
-            if (ImGui::Selectable("None", e.sprite.empty())) { e.sprite.clear(); changed = true; }
+        if (ImGui::BeginCombo(label, value.empty() ? "None" : value.c_str())) {
+            if (ImGui::Selectable("None", value.empty())) { value.clear(); changed = true; }
             for (const Asset& a : assets.all())
-                if (ImGui::Selectable(a.name.c_str(), a.name == e.sprite)) { e.sprite = a.name; changed = true; }
+                if (a.script == scripts && ImGui::Selectable(a.name.c_str(), a.name == value)) {
+                    value   = a.name;
+                    changed = true;
+                }
             ImGui::EndCombo();
         }
         if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ASSET")) {
-                e.sprite = static_cast<const char*>(p->Data);
-                changed  = true;
+            if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload(scripts ? "SCRIPT" : "SPRITE")) {
+                value   = static_cast<const char*>(p->Data);
+                changed = true;
             }
             ImGui::EndDragDropTarget();
         }
@@ -493,22 +616,42 @@ private:
                     forOthers([&](Entity& o) { o.x += e.x - px; o.y += e.y - py; });
                 if (dragFloat("Rotation", &e.rotation))
                     forOthers([&](Entity& o) { o.rotation = e.rotation; });
-                if (dragFloat2("Scale", &e.sx, 0.02f, 0.05f, 50.0f, "%.2f"))
+
+                // Scale, with a lock that keeps X and Y equal
+                if (iconButton("scaleLock", scaleLocked ? Icon::Lock : Icon::Unlock, scaleLocked, true,
+                               scaleLocked ? "X and Y change together" : "Click to link X and Y")) {
+                    scaleLocked = !scaleLocked;
+                    if (scaleLocked) forSelected([](Entity& o) { o.sy = o.sx; });
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(ImGui::CalcItemWidth() - ImGui::GetFrameHeight() - ImGui::GetStyle().ItemSpacing.x);
+                const float ox = e.sx, oy = e.sy;
+                if (dragFloat2("Scale", &e.sx, 0.02f, 0.05f, 50.0f, "%.2f")) {
+                    if (scaleLocked) {
+                        if (e.sx != ox) e.sy = e.sx;
+                        else            e.sx = e.sy;
+                    }
                     forOthers([&](Entity& o) { o.sx = e.sx; o.sy = e.sy; });
-                if (spriteField(e))
+                }
+
+                if (assetField("Sprite", e.sprite, false))
                     forOthers([&](Entity& o) { o.sprite = e.sprite; });
+                if (assetField("Script", e.script, true))
+                    forOthers([&](Entity& o) { o.script = e.script; });
 
                 ImGui::Separator();
+                ImGui::BeginDisabled(!editing());
                 if (ImGui::Button("Delete")) deleteSelected();
+                ImGui::EndDisabled();
             } else {
                 ImGui::TextDisabled("Nothing selected");
             }
 
             // Right-click on empty space (the resets come first: entityMenu may delete objects)
             if (scene.hasSelection() && ImGui::BeginPopupContextWindow("inspectorMenu", rightClickEmpty)) {
-                if (ImGui::MenuItem("Reset Position")) forSelected([](Entity& e) { e.x = e.y = 0; });
-                if (ImGui::MenuItem("Reset Rotation")) forSelected([](Entity& e) { e.rotation = 0; });
-                if (ImGui::MenuItem("Reset Scale"))    forSelected([](Entity& e) { e.sx = e.sy = 1; });
+                if (ImGui::MenuItem("Reset Position")) forSelected([](Entity& o) { o.x = o.y = 0; });
+                if (ImGui::MenuItem("Reset Rotation")) forSelected([](Entity& o) { o.rotation = 0; });
+                if (ImGui::MenuItem("Reset Scale"))    forSelected([](Entity& o) { o.sx = o.sy = 1; });
                 ImGui::Separator();
                 entityMenu();
                 ImGui::EndPopup();
@@ -555,12 +698,17 @@ private:
 
         if (ImGui::Button("Refresh")) refreshAssets = true;
         ImGui::SameLine();
+        if (ImGui::Button("New Script")) {
+            selectedAsset = assets.createScript();
+            refreshAssets = true;
+        }
+        ImGui::SameLine();
         ImGui::TextDisabled("%s", assets.folder().c_str());
 
         ImGui::BeginChild("assetGrid");
         const auto& list = assets.all();
         if (list.empty())
-            ImGui::TextDisabled("No PNG files yet. Drop PNGs onto this window or copy them into the folder above.");
+            ImGui::TextDisabled("Nothing here yet. Drop PNG or Lua files onto this window, or use New Script.");
 
         const float thumb   = 64;
         const float gap     = ImGui::GetStyle().ItemSpacing.x;
@@ -575,10 +723,10 @@ private:
         ImGui::EndChild();
     }
 
-    // One thumbnail: click to select, drag it into the Scene, right-click for options
+    // One tile: click to select, double-click to open, drag to use it, right-click for options
     void assetCell(const Asset& a, float thumb) {
         float tw = 16, th = 16;
-        SDL_GetTextureSize(a.texture, &tw, &th);
+        if (a.texture) SDL_GetTextureSize(a.texture, &tw, &th);
         float sc = std::min(thumb / tw, thumb / th);
         if (sc >= 1) sc = std::floor(sc);   // whole-number zoom keeps pixel art crisp
         const ImVec2 size(tw * sc, th * sc);
@@ -589,32 +737,45 @@ private:
         const bool   hovered = ImGui::IsItemHovered();
         const bool   chosen  = a.name == selectedAsset;
         const ImVec2 p0 = ImGui::GetItemRectMin(), p1 = ImGui::GetItemRectMax();
-        const ImVec2 q0(std::floor(p0.x + (thumb - size.x) / 2), std::floor(p0.y + (thumb - size.y) / 2));
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
         dl->AddRectFilled(p0, p1, ImGui::GetColorU32(col(chosen ? UI::button : UI::bg)));
-        dl->AddImage(tid(a.texture), q0, {q0.x + size.x, q0.y + size.y});
+        if (a.texture) {
+            const ImVec2 q0(std::floor(p0.x + (thumb - size.x) / 2), std::floor(p0.y + (thumb - size.y) / 2));
+            dl->AddImage(tid(a.texture), q0, {q0.x + size.x, q0.y + size.y});
+        } else {   // scripts have no picture: show a tag instead
+            const ImVec2 ts = ImGui::CalcTextSize("LUA");
+            dl->AddText({std::floor(p0.x + (thumb - ts.x) / 2), std::floor(p0.y + (thumb - ts.y) / 2)},
+                        ImGui::GetColorU32(col(UI::accent)), "LUA");
+        }
         dl->AddRect(p0, p1, ImGui::GetColorU32(col(chosen || hovered ? UI::accent : UI::border)));
 
+        if (hovered && ImGui::IsMouseDoubleClicked(0)) assets.open(a.name);
+
         if (ImGui::BeginDragDropSource()) {
-            ImGui::SetDragDropPayload("ASSET", a.name.c_str(), a.name.size() + 1);
-            ImGui::Image(tid(a.texture), {size.x * 0.5f, size.y * 0.5f});
+            ImGui::SetDragDropPayload(a.script ? "SCRIPT" : "SPRITE", a.name.c_str(), a.name.size() + 1);
+            if (a.texture) ImGui::Image(tid(a.texture), {size.x * 0.5f, size.y * 0.5f});
             ImGui::TextUnformatted(a.name.c_str());
             ImGui::EndDragDropSource();
         }
 
         if (ImGui::BeginPopupContextItem("assetMenu", rightClick)) {
-            if (ImGui::MenuItem("Add to Scene")) addObjectAtCenter(a.name);
-            ImGui::Separator();
-            if (ImGui::MenuItem("Pixel filter (crisp)", nullptr, !a.smooth)) assets.setSmooth(a.name, false);
-            if (ImGui::MenuItem("Smooth filter",        nullptr,  a.smooth)) assets.setSmooth(a.name, true);
+            if (ImGui::MenuItem("Open")) assets.open(a.name);
+            if (!a.script) {
+                if (ImGui::MenuItem("Add to Scene", nullptr, false, editing())) addObjectAtCenter(a.name);
+                ImGui::Separator();
+                if (ImGui::MenuItem("Pixel filter (crisp)", nullptr, !a.smooth)) assets.setSmooth(a.name, false);
+                if (ImGui::MenuItem("Smooth filter",        nullptr,  a.smooth)) assets.setSmooth(a.name, true);
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Delete...", "Del")) askDeleteAsset(a.name);
             ImGui::EndPopup();
         }
 
-        if (hovered && !ImGui::GetDragDropPayload())
-            ImGui::SetTooltip("%s\n%d x %d  (%s)", a.name.c_str(), int(tw), int(th), a.smooth ? "Smooth" : "Pixel");
+        if (hovered && !ImGui::GetDragDropPayload()) {
+            if (a.script) ImGui::SetTooltip("%s\nLua script", a.name.c_str());
+            else ImGui::SetTooltip("%s\n%d x %d  (%s)", a.name.c_str(), int(tw), int(th), a.smooth ? "Smooth" : "Pixel");
+        }
 
         ImGui::TextUnformatted(fitText(fs::path(a.name).filename().string(), thumb).c_str());
         ImGui::EndGroup();
@@ -631,7 +792,7 @@ private:
                                    ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
             ImGui::Text("Delete \"%s\"?", askDelete.c_str());
             ImGui::TextDisabled("The file moves to the Recycle Bin.");
-            ImGui::TextDisabled("Objects that use it will show a red box.");
+            ImGui::TextDisabled("Objects that use it will no longer find it.");
             ImGui::Spacing();
             if (ImGui::Button("Delete", {120, 0})) {
                 deleteAsset = askDelete;
@@ -644,8 +805,6 @@ private:
         }
     }
 
-    enum class Drag { None, Move, Marquee };
-
     Window&       win;
     SDL_Renderer* r;
     AssetStore    assets;
@@ -653,6 +812,9 @@ private:
     int           viewScale   = 0;
     SDL_Texture*  logIcons[3] = {};
     Scene         scene;
+    Scripting     scripting;
+    Mode          mode          = Mode::Stopped;
+    Uint64        lastTicks     = 0;
     size_t        lastLogCount  = 0;
     bool          refreshAssets = false;
 
@@ -667,6 +829,9 @@ private:
     std::vector<std::pair<int, SDL_FPoint>> origins; // where the moved objects started
     std::vector<int> marqueeBase;                    // selection kept while adding with a box
     float clickX = 0, clickY = 0;                    // where the last right-click landed
+
+    // Inspector
+    bool scaleLocked = false;
 
     // Assets
     std::string selectedAsset;

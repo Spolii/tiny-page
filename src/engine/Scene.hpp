@@ -15,6 +15,7 @@ struct Entity {
     float        rotation = 0;    // degrees, clockwise
     float        sx = 1, sy = 1;  // scale; keep sx and sy together
     std::string  sprite;          // asset name (see AssetStore), empty = none
+    std::string  script;          // asset name of a .lua file, empty = none
 
     bool operator==(const Entity&) const = default;
 };
@@ -158,9 +159,25 @@ struct Scene {
         }
     }
 
+    // ---- play mode: the scene is saved on Play and restored on Stop ----
+    bool isPlaying() const { return playing; }
+
+    void beginPlay() {
+        commitIfChanged();
+        playBackup = entities;
+        playing    = true;
+    }
+
+    void endPlay() {
+        entities = std::move(playBackup);
+        playBackup.clear();
+        playing = false;
+        setSelection(selection, active);
+    }
+
     // ---- history (snapshots of `entities`) ----
-    bool canUndo() const { return !undoStack.empty(); }
-    bool canRedo() const { return !redoStack.empty(); }
+    bool canUndo() const { return !playing && !undoStack.empty(); }
+    bool canRedo() const { return !playing && !redoStack.empty(); }
 
     // Call once after building the initial scene
     void resetHistory() {
@@ -171,7 +188,7 @@ struct Scene {
 
     // Call every frame while nothing is being dragged or typed
     void commitIfChanged() {
-        if (entities == baseline) return;
+        if (playing || entities == baseline) return;
         undoStack.push_back(baseline);
         if (undoStack.size() > 100) undoStack.erase(undoStack.begin());
         baseline = entities;
@@ -179,6 +196,7 @@ struct Scene {
     }
 
     void undo() {
+        if (playing) return;
         commitIfChanged();
         if (undoStack.empty()) return;
         redoStack.push_back(entities);
@@ -189,6 +207,7 @@ struct Scene {
     }
 
     void redo() {
+        if (playing) return;
         commitIfChanged();
         if (redoStack.empty()) return;
         undoStack.push_back(entities);
@@ -236,6 +255,8 @@ private:
         SDL_RenderLines(r, pts, 5);
     }
 
+    bool                             playing = false;
+    std::vector<Entity>              playBackup;
     std::vector<Entity>              baseline;
     std::vector<std::vector<Entity>> undoStack, redoStack;
 };

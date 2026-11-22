@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(tiny-page LANGUAGES CXX)
+project(tiny-page LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -17,7 +17,11 @@ FetchContent_Declare(imgui
     GIT_REPOSITORY https://github.com/ocornut/imgui.git
     GIT_TAG        v1.91.9b
     GIT_SHALLOW    TRUE)
-FetchContent_MakeAvailable(SDL3 imgui)
+FetchContent_Declare(lua
+    GIT_REPOSITORY https://github.com/lua/lua.git
+    GIT_TAG        v5.4.7
+    GIT_SHALLOW    TRUE)
+FetchContent_MakeAvailable(SDL3 imgui lua)
 
 # imgui has no CMakeLists, so build it as a small static library
 add_library(imgui STATIC
@@ -31,12 +35,18 @@ add_library(imgui STATIC
 target_include_directories(imgui PUBLIC ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
 target_link_libraries(imgui PUBLIC SDL3::SDL3)
 
+# Same for Lua: every .c file except the command-line programs and the test file
+file(GLOB LUA_SOURCES ${lua_SOURCE_DIR}/*.c)
+list(FILTER LUA_SOURCES EXCLUDE REGEX "/(lua|luac|onelua|ltests)\\.c$")
+add_library(lua STATIC ${LUA_SOURCES})
+target_include_directories(lua PUBLIC ${lua_SOURCE_DIR})
+
 add_executable(tiny-page src/main.cpp)
 target_include_directories(tiny-page PRIVATE src)
-target_link_libraries(tiny-page PRIVATE SDL3::SDL3 imgui)
+target_link_libraries(tiny-page PRIVATE SDL3::SDL3 imgui lua)
 target_link_options(tiny-page PRIVATE -static)
 
-# The game project (sprites etc.) lives in the repo, not next to the exe
+# The game project (sprites, scripts) lives in the repo, not next to the exe
 target_compile_definitions(tiny-page PRIVATE PROJECT_DIR="${CMAKE_SOURCE_DIR}/project")
 
 # Copy the editor's own assets next to the exe
