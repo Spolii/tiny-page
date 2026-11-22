@@ -94,6 +94,11 @@ public:
 private:
     static constexpr int viewW = 320, viewH = 180;   // scene size in scene units
 
+    // Context menus: a popup's mouse button is part of its flags and 0 means LEFT,
+    // so every menu names the right button explicitly.
+    static constexpr ImGuiPopupFlags rightClick      = ImGuiPopupFlags_MouseButtonRight;
+    static constexpr ImGuiPopupFlags rightClickEmpty = ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems;
+
     static ImVec4 col(SDL_Color c, float a = 1) { return {c.r / 255.f, c.g / 255.f, c.b / 255.f, a}; }
     static ImTextureID tid(SDL_Texture* t) { return (ImTextureID)(intptr_t)t; }
 
@@ -168,12 +173,12 @@ private:
     }
 
     // ---- actions (shared by shortcuts, menu bar and right-click menus) ----
-    void undo()           { scene.undo(); renaming = -1; }
-    void redo()           { scene.redo(); renaming = -1; }
-    void deleteSelected() { scene.removeSelected(); renaming = -1; }
+    void undo()              { scene.undo(); renaming = -1; }
+    void redo()              { scene.redo(); renaming = -1; }
+    void deleteSelected()    { scene.removeSelected(); renaming = -1; }
     void duplicateSelected() { scene.duplicateSelected(); renaming = -1; }
-    void bringToFront()   { scene.bringToFront(); renaming = -1; }
-    void sendToBack()     { scene.sendToBack(); renaming = -1; }
+    void bringToFront()      { scene.bringToFront(); renaming = -1; }
+    void sendToBack()        { scene.sendToBack(); renaming = -1; }
 
     void startRename() {
         if (!scene.hasSelection()) return;
@@ -190,13 +195,13 @@ private:
 
     // The one menu every right-click on an object uses
     void entityMenu() {
-        if (ImGui::MenuItem("Rename", "F2"))          startRename();
-        if (ImGui::MenuItem("Duplicate", "Ctrl+D"))   duplicateSelected();
+        if (ImGui::MenuItem("Rename", "F2"))        startRename();
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D")) duplicateSelected();
         ImGui::Separator();
-        if (ImGui::MenuItem("Bring to Front"))        bringToFront();
-        if (ImGui::MenuItem("Send to Back"))          sendToBack();
+        if (ImGui::MenuItem("Bring to Front"))      bringToFront();
+        if (ImGui::MenuItem("Send to Back"))        sendToBack();
         ImGui::Separator();
-        if (ImGui::MenuItem("Delete", "Del"))         deleteSelected();
+        if (ImGui::MenuItem("Delete", "Del"))       deleteSelected();
     }
 
     void shortcuts() {
@@ -259,7 +264,7 @@ private:
                         if (ImGui::IsMouseDoubleClicked(0)) startRename();
                     }
                     if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) scene.selected = i;
-                    if (ImGui::BeginPopupContextItem()) {
+                    if (ImGui::BeginPopupContextItem(nullptr, rightClick)) {
                         entityMenu();
                         ImGui::EndPopup();
                     }
@@ -267,7 +272,7 @@ private:
                 ImGui::PopID();
             }
 
-            if (ImGui::BeginPopupContextWindow("hierarchyMenu", ImGuiPopupFlags_NoOpenOverItems)) {
+            if (ImGui::BeginPopupContextWindow("hierarchyMenu", rightClickEmpty)) {
                 if (ImGui::MenuItem("Add Object")) addObjectAtCenter();
                 ImGui::EndPopup();
             }
@@ -329,7 +334,7 @@ private:
             clickY = (m.y - origin.y) / s;
             scene.selected = scene.pick(clickX, clickY);
         }
-        if (ImGui::BeginPopupContextItem("sceneMenu")) {
+        if (ImGui::BeginPopupContextItem("sceneMenu", rightClick)) {
             if (scene.hasSelection()) entityMenu();
             else if (ImGui::MenuItem("Add Object")) addObject(clickX - 8, clickY - 8);
             ImGui::EndPopup();
@@ -350,8 +355,7 @@ private:
             }
 
             // Right-click on empty space (the resets come first: entityMenu may delete the object)
-            if (scene.hasSelection() &&
-                ImGui::BeginPopupContextWindow("inspectorMenu", ImGuiPopupFlags_NoOpenOverItems)) {
+            if (scene.hasSelection() && ImGui::BeginPopupContextWindow("inspectorMenu", rightClickEmpty)) {
                 Entity& e = scene.entities[scene.selected];
                 if (ImGui::MenuItem("Reset Position")) e.x = e.y = 0;
                 if (ImGui::MenuItem("Reset Rotation")) e.rotation = 0;
