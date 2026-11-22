@@ -1,5 +1,6 @@
 #pragma once
 #include <SDL3/SDL.h>
+#include <algorithm>
 #include <cmath>
 #include <numbers>
 #include <string>
@@ -31,6 +32,29 @@ struct Scene {
         if (!hasSelection()) return;
         entities.erase(entities.begin() + selected);
         selected = -1;
+    }
+
+    void duplicateSelected() {
+        if (!hasSelection()) return;
+        Entity copy = entities[selected];
+        copy.name += " Copy";
+        copy.x += 8;
+        copy.y += 8;
+        entities.push_back(copy);
+        selected = int(entities.size()) - 1;
+    }
+
+    // Entities are drawn in list order: the last one is on top
+    void bringToFront() {
+        if (!hasSelection()) return;
+        std::rotate(entities.begin() + selected, entities.begin() + selected + 1, entities.end());
+        selected = int(entities.size()) - 1;
+    }
+
+    void sendToBack() {
+        if (!hasSelection()) return;
+        std::rotate(entities.begin(), entities.begin() + selected, entities.begin() + selected + 1);
+        selected = 0;
     }
 
     // Unrotated box in scene units

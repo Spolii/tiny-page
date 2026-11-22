@@ -167,10 +167,37 @@ private:
         viewScale = s;
     }
 
-    // ---- actions (used by both the shortcuts and the menus) ----
-    void undo() { scene.undo(); renaming = -1; }
-    void redo() { scene.redo(); renaming = -1; }
+    // ---- actions (shared by shortcuts, menu bar and right-click menus) ----
+    void undo()           { scene.undo(); renaming = -1; }
+    void redo()           { scene.redo(); renaming = -1; }
     void deleteSelected() { scene.removeSelected(); renaming = -1; }
+    void duplicateSelected() { scene.duplicateSelected(); renaming = -1; }
+    void bringToFront()   { scene.bringToFront(); renaming = -1; }
+    void sendToBack()     { scene.sendToBack(); renaming = -1; }
+
+    void startRename() {
+        if (!scene.hasSelection()) return;
+        renaming    = scene.selected;
+        renameFocus = true;
+    }
+
+    void addObject(float x, float y) {
+        scene.add("Object", std::round(x), std::round(y), spriteIcon);
+        scene.selected = int(scene.entities.size()) - 1;
+    }
+
+    void addObjectAtCenter() { addObject(viewW / 2.0f - 8, viewH / 2.0f - 8); }
+
+    // The one menu every right-click on an object uses
+    void entityMenu() {
+        if (ImGui::MenuItem("Rename", "F2"))          startRename();
+        if (ImGui::MenuItem("Duplicate", "Ctrl+D"))   duplicateSelected();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Bring to Front"))        bringToFront();
+        if (ImGui::MenuItem("Send to Back"))          sendToBack();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Delete", "Del"))         deleteSelected();
+    }
 
     void shortcuts() {
         const ImGuiIO& io = ImGui::GetIO();
@@ -178,7 +205,9 @@ private:
 
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) io.KeyShift ? redo() : undo();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) redo();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) duplicateSelected();
         if (ImGui::IsKeyPressed(ImGuiKey_Delete)) deleteSelected();
+        if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) startRename();
     }
 
     void menuBar() {
@@ -192,14 +221,12 @@ private:
             if (ImGui::MenuItem("Undo", "Ctrl+Z", false, scene.canUndo())) undo();
             if (ImGui::MenuItem("Redo", "Ctrl+Y", false, scene.canRedo())) redo();
             ImGui::Separator();
+            if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, scene.hasSelection())) duplicateSelected();
             if (ImGui::MenuItem("Delete", "Del", false, scene.hasSelection())) deleteSelected();
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Scene")) {
-            if (ImGui::MenuItem("Add Object")) {
-                scene.add("Object", viewW / 2, viewH / 2, spriteIcon);
-                scene.selected = int(scene.entities.size()) - 1;
-            }
+            if (ImGui::MenuItem("Add Object")) addObjectAtCenter();
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Debug")) {
@@ -225,12 +252,24 @@ private:
                     ImGui::InputText("##rename", &e.name,
                         ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
                     if (ImGui::IsItemDeactivated()) renaming = -1;   // Enter, Esc or click away
-                } else if (ImGui::Selectable(e.name.c_str(), scene.selected == i,
-                                             ImGuiSelectableFlags_AllowDoubleClick)) {
-                    scene.selected = i;
-                    if (ImGui::IsMouseDoubleClicked(0)) { renaming = i; renameFocus = true; }
+                } else {
+                    if (ImGui::Selectable(e.name.c_str(), scene.selected == i,
+                                          ImGuiSelectableFlags_AllowDoubleClick)) {
+                        scene.selected = i;
+                        if (ImGui::IsMouseDoubleClicked(0)) startRename();
+                    }
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) scene.selected = i;
+                    if (ImGui::BeginPopupContextItem()) {
+                        entityMenu();
+                        ImGui::EndPopup();
+                    }
                 }
                 ImGui::PopID();
+            }
+
+            if (ImGui::BeginPopupContextWindow("hierarchyMenu", ImGuiPopupFlags_NoOpenOverItems)) {
+                if (ImGui::MenuItem("Add Object")) addObjectAtCenter();
+                ImGui::EndPopup();
             }
         }
         ImGui::End();
@@ -252,6 +291,7 @@ private:
             ImGui::SetCursorScreenPos(origin);
             ImGui::InvisibleButton("viewport", size);
             dragInScene(origin, float(s));
+            sceneMenu(origin, float(s));
         }
         ImGui::End();
     }
@@ -281,6 +321,21 @@ private:
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
     }
 
+    // Right-click in the Scene: select what is under the mouse, then show the menu
+    void sceneMenu(ImVec2 origin, float s) {
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+            const ImVec2 m = ImGui::GetMousePos();
+            clickX = (m.x - origin.x) / s;
+            clickY = (m.y - origin.y) / s;
+            scene.selected = scene.pick(clickX, clickY);
+        }
+        if (ImGui::BeginPopupContextItem("sceneMenu")) {
+            if (scene.hasSelection()) entityMenu();
+            else if (ImGui::MenuItem("Add Object")) addObject(clickX - 8, clickY - 8);
+            ImGui::EndPopup();
+        }
+    }
+
     void inspector(float x, float y, float w, float h) {
         if (panel("Inspector", x, y, w, h)) {
             if (scene.hasSelection()) {
@@ -292,6 +347,17 @@ private:
                 if (ImGui::Button("Delete")) deleteSelected();
             } else {
                 ImGui::TextDisabled("Nothing selected");
+            }
+
+            // Right-click on empty space (the resets come first: entityMenu may delete the object)
+            if (scene.hasSelection() &&
+                ImGui::BeginPopupContextWindow("inspectorMenu", ImGuiPopupFlags_NoOpenOverItems)) {
+                Entity& e = scene.entities[scene.selected];
+                if (ImGui::MenuItem("Reset Position")) e.x = e.y = 0;
+                if (ImGui::MenuItem("Reset Rotation")) e.rotation = 0;
+                ImGui::Separator();
+                entityMenu();
+                ImGui::EndPopup();
             }
         }
         ImGui::End();
@@ -343,4 +409,5 @@ private:
     bool  renameFocus = false;
     bool  dragging    = false;   // dragging a sprite in the Scene view
     float grabX = 0, grabY = 0;
+    float clickX = 0, clickY = 0;   // where the last right-click landed, in scene units
 };
