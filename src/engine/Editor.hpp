@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <utility>
 #include "AssetStore.hpp"
 #include "Scene.hpp"
 #include "core/Assets.hpp"
@@ -39,8 +40,8 @@ public:
         // Demo objects, for whichever of these assets exist in project/assets
         scene.assets = &assets;
         const struct { const char* name; const char* sprite; float x, y; } demo[] = {
-            {"Icon", "icon.png", 40, 40}, {"Info", "info.png", 120, 60},
-            {"Warning", "warning.png", 200, 90}, {"Error", "error.png", 120, 130},
+            {"Icon", "icon.png", 48, 48}, {"Info", "info.png", 128, 68},
+            {"Warning", "warning.png", 208, 98}, {"Error", "error.png", 128, 138},
         };
         for (const auto& d : demo)
             if (assets.find(d.sprite)) scene.add(d.name, d.x, d.y, d.sprite);
@@ -60,11 +61,20 @@ public:
     }
 
     void frame() {
-        // Safe moment to reload textures: nothing from this frame references them yet
+        // Safe moment to change textures: nothing from this frame references them yet
+        if (!deleteAsset.empty()) {
+            assets.remove(deleteAsset);
+            deleteAsset.clear();
+            selectedAsset.clear();
+            refreshAssets = true;
+        }
         if (refreshAssets) {
             assets.refresh();
             refreshAssets = false;
         }
+
+        assetsFocusedLast = assetsFocused;   // so Delete knows what you clicked last
+        assetsFocused     = false;
 
         // 1. Build the UI
         ImGui_ImplSDLRenderer3_NewFrame();
@@ -85,6 +95,7 @@ public:
         sceneView(left, top, midW, midH);
         inspector(left + midW, top, right, midH);
         bottomPanel(0, top + midH, d.x, bottom);
+        deleteAssetDialog();
 
         // One finished drag / rename / action = one undo step
         if (!ImGui::IsAnyItemActive()) scene.commitIfChanged();
@@ -124,17 +135,21 @@ private:
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus | extra);
     }
 
-    // Show a "drag sideways" cursor on the last widget
+    // Draggable number fields: show a "drag sideways" cursor, return true when the value changed
     static void dragCursor() {
         if (ImGui::IsItemHovered() || ImGui::IsItemActive()) ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
     }
-    static void dragFloat(const char* label, float* v, float speed = 1) {
-        ImGui::DragFloat(label, v, speed, 0, 0, "%.1f");
+    static bool dragFloat(const char* label, float* v, float speed = 1, float min = 0, float max = 0,
+                          const char* fmt = "%.1f") {
+        const bool changed = ImGui::DragFloat(label, v, speed, min, max, fmt);
         dragCursor();
+        return changed;
     }
-    static void dragFloat2(const char* label, float* v, float speed = 1) {
-        ImGui::DragFloat2(label, v, speed, 0, 0, "%.1f");
+    static bool dragFloat2(const char* label, float* v, float speed = 1, float min = 0, float max = 0,
+                           const char* fmt = "%.1f") {
+        const bool changed = ImGui::DragFloat2(label, v, speed, min, max, fmt);
         dragCursor();
+        return changed;
     }
 
     // Shorten a name with ".." so it fits in `width` pixels
@@ -204,20 +219,29 @@ private:
 
     void startRename() {
         if (!scene.hasSelection()) return;
-        renaming    = scene.selected;
+        renaming    = scene.active;
         renameFocus = true;
     }
 
-    // `sprite` is an asset name; empty = an object without a sprite
+    void askDeleteAsset(const std::string& name) {
+        askDelete        = name;
+        openDeleteDialog = true;
+    }
+
+    // `sprite` is an asset name; empty = an object without a sprite. x, y = center.
     void addObject(float x, float y, const std::string& sprite = {}) {
         const std::string name = sprite.empty() ? "Object" : fs::path(sprite).stem().string();
         scene.add(name, std::round(x), std::round(y), sprite);
-        scene.selected = int(scene.entities.size()) - 1;
+        scene.select(int(scene.entities.size()) - 1);
     }
 
-    void addObjectAtCenter(const std::string& sprite = {}) {
-        const SDL_FPoint s = assets.size(sprite);
-        addObject(viewW / 2.0f - s.x / 2, viewH / 2.0f - s.y / 2, sprite);
+    void addObjectAtCenter(const std::string& sprite = {}) { addObject(viewW / 2.0f, viewH / 2.0f, sprite); }
+
+    template <class F> void forSelected(F fn) {
+        for (int i : scene.selection) fn(scene.entities[i]);
+    }
+    template <class F> void forOthers(F fn) {   // everything selected except the one the Inspector shows
+        for (int i : scene.selection) if (i != scene.active) fn(scene.entities[i]);
     }
 
     // The one menu every right-click on an object uses
@@ -233,13 +257,19 @@ private:
 
     void shortcuts() {
         const ImGuiIO& io = ImGui::GetIO();
-        if (io.WantTextInput) return;   // typing in a text box: leave the keys alone
+        // typing in a text box or a menu/dialog is open: leave the keys alone
+        if (io.WantTextInput ||
+            ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) return;
 
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) io.KeyShift ? redo() : undo();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) redo();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) duplicateSelected();
-        if (ImGui::IsKeyPressed(ImGuiKey_Delete)) deleteSelected();
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A, false)) scene.selectAll();
         if (ImGui::IsKeyPressed(ImGuiKey_F2, false)) startRename();
+        if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
+            if (assetsFocusedLast && !selectedAsset.empty()) askDeleteAsset(selectedAsset);
+            else deleteSelected();
+        }
     }
 
     void menuBar() {
@@ -253,6 +283,7 @@ private:
             if (ImGui::MenuItem("Undo", "Ctrl+Z", false, scene.canUndo())) undo();
             if (ImGui::MenuItem("Redo", "Ctrl+Y", false, scene.canRedo())) redo();
             ImGui::Separator();
+            if (ImGui::MenuItem("Select All", "Ctrl+A")) scene.selectAll();
             if (ImGui::MenuItem("Duplicate", "Ctrl+D", false, scene.hasSelection())) duplicateSelected();
             if (ImGui::MenuItem("Delete", "Del", false, scene.hasSelection())) deleteSelected();
             ImGui::EndMenu();
@@ -275,6 +306,7 @@ private:
 
     void hierarchy(float x, float y, float w, float h) {
         if (panel("Hierarchy", x, y, w, h)) {
+            const ImGuiIO& io = ImGui::GetIO();
             for (int i = 0; i < int(scene.entities.size()); ++i) {
                 Entity& e = scene.entities[i];
                 ImGui::PushID(i);
@@ -285,12 +317,24 @@ private:
                         ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
                     if (ImGui::IsItemDeactivated()) renaming = -1;   // Enter, Esc or click away
                 } else {
-                    if (ImGui::Selectable(e.name.c_str(), scene.selected == i,
+                    if (ImGui::Selectable(e.name.c_str(), scene.isSelected(i),
                                           ImGuiSelectableFlags_AllowDoubleClick)) {
-                        scene.selected = i;
-                        if (ImGui::IsMouseDoubleClicked(0)) startRename();
+                        if (io.KeyShift) {
+                            if (anchor < 0) anchor = i;
+                            scene.selectRange(anchor, i);
+                        } else if (io.KeyCtrl) {
+                            scene.toggle(i);
+                            anchor = i;
+                        } else {
+                            scene.select(i);
+                            anchor = i;
+                            if (ImGui::IsMouseDoubleClicked(0)) startRename();
+                        }
                     }
-                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) scene.selected = i;
+                    if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
+                        if (!scene.isSelected(i)) { scene.select(i); anchor = i; }
+                        else scene.active = i;
+                    }
                     if (ImGui::BeginPopupContextItem(nullptr, rightClick)) {
                         entityMenu();
                         ImGui::EndPopup();
@@ -329,28 +373,62 @@ private:
         ImGui::End();
     }
 
-    // Click to select, drag to move (call right after the viewport's InvisibleButton)
+    // Click to select (Ctrl/Shift adds), drag a selected object to move the selection,
+    // drag on empty space for a selection box. Call right after the viewport's InvisibleButton.
     void dragInScene(ImVec2 origin, float s) {
-        const ImVec2 m  = ImGui::GetMousePos();
-        const float  mx = (m.x - origin.x) / s;
-        const float  my = (m.y - origin.y) / s;
+        const ImGuiIO& io = ImGui::GetIO();
+        const ImVec2   m  = ImGui::GetMousePos();
+        const float    mx = (m.x - origin.x) / s;
+        const float    my = (m.y - origin.y) / s;
+        const bool additive = io.KeyCtrl || io.KeyShift;
 
         if (ImGui::IsItemActivated()) {
-            scene.selected = scene.pick(mx, my);
-            dragging       = scene.hasSelection();
-            if (dragging) {
-                grabX = mx - scene.entities[scene.selected].x;
-                grabY = my - scene.entities[scene.selected].y;
+            const int hit = scene.pick(mx, my);
+            drag  = Drag::None;
+            grabX = mx;
+            grabY = my;
+            if (hit >= 0) {
+                if (additive)                     scene.toggle(hit);
+                else if (!scene.isSelected(hit))  scene.select(hit);
+                else                              scene.active = hit;
+
+                if (scene.isSelected(hit)) {
+                    drag = Drag::Move;
+                    origins.clear();
+                    for (int i : scene.selection) origins.push_back({i, {scene.entities[i].x, scene.entities[i].y}});
+                }
+            } else {
+                drag = Drag::Marquee;
+                marqueeBase = additive ? scene.selection : std::vector<int>{};
+                if (!additive) scene.select(-1);
             }
         }
-        if (!ImGui::IsItemActive()) dragging = false;
+        if (!ImGui::IsItemActive()) drag = Drag::None;
 
-        if (dragging) {
-            Entity& e = scene.entities[scene.selected];
-            e.x = std::round(mx - grabX);
-            e.y = std::round(my - grabY);
+        if (drag == Drag::Move) {
+            const float dx = std::round(mx - grabX), dy = std::round(my - grabY);
+            for (const auto& [i, p] : origins) {
+                if (i >= int(scene.entities.size())) continue;
+                scene.entities[i].x = p.x + dx;
+                scene.entities[i].y = p.y + dy;
+            }
         }
-        if (dragging || (ImGui::IsItemHovered() && scene.pick(mx, my) >= 0))
+
+        if (drag == Drag::Marquee) {
+            const float x0 = std::min(grabX, mx), x1 = std::max(grabX, mx);
+            const float y0 = std::min(grabY, my), y1 = std::max(grabY, my);
+
+            std::vector<int> sel = marqueeBase;
+            for (int i : scene.inRect(x0, y0, x1, y1)) sel.push_back(i);
+            scene.setSelection(sel, scene.active);
+
+            const ImVec2 a(origin.x + x0 * s, origin.y + y0 * s), b(origin.x + x1 * s, origin.y + y1 * s);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(a, b, ImGui::GetColorU32(col(UI::accent, 0.15f)));
+            dl->AddRect(a, b, ImGui::GetColorU32(col(UI::accent)));
+        }
+
+        if (drag == Drag::Move || (drag == Drag::None && ImGui::IsItemHovered() && scene.pick(mx, my) >= 0))
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
     }
 
@@ -358,10 +436,8 @@ private:
     void sceneDrop(ImVec2 origin, float s) {
         if (!ImGui::BeginDragDropTarget()) return;
         if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ASSET")) {
-            const std::string  name = static_cast<const char*>(p->Data);
-            const SDL_FPoint   size = assets.size(name);
-            const ImVec2       m    = ImGui::GetMousePos();
-            addObject((m.x - origin.x) / s - size.x / 2, (m.y - origin.y) / s - size.y / 2, name);
+            const ImVec2 m = ImGui::GetMousePos();
+            addObject((m.x - origin.x) / s, (m.y - origin.y) / s, static_cast<const char*>(p->Data));
         }
         ImGui::EndDragDropTarget();
     }
@@ -372,49 +448,67 @@ private:
             const ImVec2 m = ImGui::GetMousePos();
             clickX = (m.x - origin.x) / s;
             clickY = (m.y - origin.y) / s;
-            scene.selected = scene.pick(clickX, clickY);
+            const int hit = scene.pick(clickX, clickY);
+            if (hit < 0)                     scene.select(-1);
+            else if (!scene.isSelected(hit)) scene.select(hit);
+            else                             scene.active = hit;
         }
         if (ImGui::BeginPopupContextItem("sceneMenu", rightClick)) {
             if (scene.hasSelection()) entityMenu();
-            else if (ImGui::MenuItem("Add Object")) addObject(clickX - 8, clickY - 8);
+            else if (ImGui::MenuItem("Add Object")) addObject(clickX, clickY);
             ImGui::EndPopup();
         }
     }
 
-    // Pick an asset from a list, or drop one from the Assets panel
-    void spriteField(Entity& e) {
+    // Pick an asset from a list, or drop one from the Assets panel. Returns true when it changed.
+    bool spriteField(Entity& e) {
+        bool changed = false;
         if (ImGui::BeginCombo("Sprite", e.sprite.empty() ? "None" : e.sprite.c_str())) {
-            if (ImGui::Selectable("None", e.sprite.empty())) e.sprite.clear();
+            if (ImGui::Selectable("None", e.sprite.empty())) { e.sprite.clear(); changed = true; }
             for (const Asset& a : assets.all())
-                if (ImGui::Selectable(a.name.c_str(), a.name == e.sprite)) e.sprite = a.name;
+                if (ImGui::Selectable(a.name.c_str(), a.name == e.sprite)) { e.sprite = a.name; changed = true; }
             ImGui::EndCombo();
         }
         if (ImGui::BeginDragDropTarget()) {
-            if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ASSET"))
+            if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ASSET")) {
                 e.sprite = static_cast<const char*>(p->Data);
+                changed  = true;
+            }
             ImGui::EndDragDropTarget();
         }
+        return changed;
     }
 
     void inspector(float x, float y, float w, float h) {
         if (panel("Inspector", x, y, w, h)) {
             if (scene.hasSelection()) {
-                Entity& e = scene.entities[scene.selected];
-                ImGui::InputText("Name", &e.name);
-                dragFloat2("Position", &e.x);
-                dragFloat("Rotation", &e.rotation);
-                spriteField(e);
+                Entity& e = scene.entities[scene.active];
+
+                if (scene.selection.size() > 1) ImGui::TextDisabled("%d objects selected", int(scene.selection.size()));
+                else                            ImGui::InputText("Name", &e.name);
+
+                // Position moves everyone by the same amount; the rest is set on everyone
+                const float px = e.x, py = e.y;
+                if (dragFloat2("Position", &e.x))
+                    forOthers([&](Entity& o) { o.x += e.x - px; o.y += e.y - py; });
+                if (dragFloat("Rotation", &e.rotation))
+                    forOthers([&](Entity& o) { o.rotation = e.rotation; });
+                if (dragFloat2("Scale", &e.sx, 0.02f, 0.05f, 50.0f, "%.2f"))
+                    forOthers([&](Entity& o) { o.sx = e.sx; o.sy = e.sy; });
+                if (spriteField(e))
+                    forOthers([&](Entity& o) { o.sprite = e.sprite; });
+
                 ImGui::Separator();
                 if (ImGui::Button("Delete")) deleteSelected();
             } else {
                 ImGui::TextDisabled("Nothing selected");
             }
 
-            // Right-click on empty space (the resets come first: entityMenu may delete the object)
+            // Right-click on empty space (the resets come first: entityMenu may delete objects)
             if (scene.hasSelection() && ImGui::BeginPopupContextWindow("inspectorMenu", rightClickEmpty)) {
-                Entity& e = scene.entities[scene.selected];
-                if (ImGui::MenuItem("Reset Position")) e.x = e.y = 0;
-                if (ImGui::MenuItem("Reset Rotation")) e.rotation = 0;
+                if (ImGui::MenuItem("Reset Position")) forSelected([](Entity& e) { e.x = e.y = 0; });
+                if (ImGui::MenuItem("Reset Rotation")) forSelected([](Entity& e) { e.rotation = 0; });
+                if (ImGui::MenuItem("Reset Scale"))    forSelected([](Entity& e) { e.sx = e.sy = 1; });
                 ImGui::Separator();
                 entityMenu();
                 ImGui::EndPopup();
@@ -457,6 +551,8 @@ private:
     }
 
     void assetsTab() {
+        assetsFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+
         if (ImGui::Button("Refresh")) refreshAssets = true;
         ImGui::SameLine();
         ImGui::TextDisabled("%s", assets.folder().c_str());
@@ -479,7 +575,7 @@ private:
         ImGui::EndChild();
     }
 
-    // One thumbnail: drag it into the Scene, right-click for options
+    // One thumbnail: click to select, drag it into the Scene, right-click for options
     void assetCell(const Asset& a, float thumb) {
         float tw = 16, th = 16;
         SDL_GetTextureSize(a.texture, &tw, &th);
@@ -488,15 +584,17 @@ private:
         const ImVec2 size(tw * sc, th * sc);
 
         ImGui::BeginGroup();
-        ImGui::InvisibleButton("cell", {thumb, thumb});
+        if (ImGui::InvisibleButton("cell", {thumb, thumb})) selectedAsset = a.name;
+        if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) selectedAsset = a.name;
         const bool   hovered = ImGui::IsItemHovered();
+        const bool   chosen  = a.name == selectedAsset;
         const ImVec2 p0 = ImGui::GetItemRectMin(), p1 = ImGui::GetItemRectMax();
         const ImVec2 q0(std::floor(p0.x + (thumb - size.x) / 2), std::floor(p0.y + (thumb - size.y) / 2));
 
         ImDrawList* dl = ImGui::GetWindowDrawList();
-        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(col(UI::bg)));
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(col(chosen ? UI::button : UI::bg)));
         dl->AddImage(tid(a.texture), q0, {q0.x + size.x, q0.y + size.y});
-        dl->AddRect(p0, p1, ImGui::GetColorU32(col(hovered ? UI::accent : UI::border)));
+        dl->AddRect(p0, p1, ImGui::GetColorU32(col(chosen || hovered ? UI::accent : UI::border)));
 
         if (ImGui::BeginDragDropSource()) {
             ImGui::SetDragDropPayload("ASSET", a.name.c_str(), a.name.size() + 1);
@@ -510,6 +608,8 @@ private:
             ImGui::Separator();
             if (ImGui::MenuItem("Pixel filter (crisp)", nullptr, !a.smooth)) assets.setSmooth(a.name, false);
             if (ImGui::MenuItem("Smooth filter",        nullptr,  a.smooth)) assets.setSmooth(a.name, true);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Delete...", "Del")) askDeleteAsset(a.name);
             ImGui::EndPopup();
         }
 
@@ -520,6 +620,32 @@ private:
         ImGui::EndGroup();
     }
 
+    // Asks before an asset file is moved to the Recycle Bin
+    void deleteAssetDialog() {
+        if (openDeleteDialog) {
+            ImGui::OpenPopup("Delete asset");
+            openDeleteDialog = false;
+        }
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {0.5f, 0.5f});
+        if (ImGui::BeginPopupModal("Delete asset", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+            ImGui::Text("Delete \"%s\"?", askDelete.c_str());
+            ImGui::TextDisabled("The file moves to the Recycle Bin.");
+            ImGui::TextDisabled("Objects that use it will show a red box.");
+            ImGui::Spacing();
+            if (ImGui::Button("Delete", {120, 0})) {
+                deleteAsset = askDelete;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", {120, 0}) || ImGui::IsKeyPressed(ImGuiKey_Escape))
+                ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+        }
+    }
+
+    enum class Drag { None, Move, Marquee };
+
     Window&       win;
     SDL_Renderer* r;
     AssetStore    assets;
@@ -527,12 +653,24 @@ private:
     int           viewScale   = 0;
     SDL_Texture*  logIcons[3] = {};
     Scene         scene;
-    size_t        lastLogCount = 0;
+    size_t        lastLogCount  = 0;
     bool          refreshAssets = false;
 
-    int   renaming    = -1;      // Hierarchy row being renamed
+    // Hierarchy
+    int   renaming    = -1;      // row being renamed
     bool  renameFocus = false;
-    bool  dragging    = false;   // dragging a sprite in the Scene view
-    float grabX = 0, grabY = 0;
-    float clickX = 0, clickY = 0;   // where the last right-click landed, in scene units
+    int   anchor      = -1;      // where Shift+click ranges start
+
+    // Scene view
+    Drag  drag  = Drag::None;
+    float grabX = 0, grabY = 0;                      // mouse position (scene units) when the drag began
+    std::vector<std::pair<int, SDL_FPoint>> origins; // where the moved objects started
+    std::vector<int> marqueeBase;                    // selection kept while adding with a box
+    float clickX = 0, clickY = 0;                    // where the last right-click landed
+
+    // Assets
+    std::string selectedAsset;
+    std::string askDelete, deleteAsset;
+    bool        openDeleteDialog = false;
+    bool        assetsFocused = false, assetsFocusedLast = false;
 };

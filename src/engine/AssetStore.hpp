@@ -1,5 +1,13 @@
 #pragma once
 #include <SDL3/SDL.h>
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <shellapi.h>
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
@@ -73,6 +81,25 @@ public:
             return false;
         }
         SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Imported %s", src.filename().string().c_str());
+        return true;
+    }
+
+    // Move the file to the Recycle Bin; call refresh() afterwards
+    bool remove(const std::string& name) {
+        std::string path = (dir() / name).make_preferred().string();
+        path.push_back('\0');   // the API wants a list that ends with two nulls
+
+        SHFILEOPSTRUCTA op{};
+        op.wFunc  = FO_DELETE;
+        op.pFrom  = path.c_str();
+        op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+        if (SHFileOperationA(&op) != 0 || op.fAnyOperationsAborted) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Could not delete %s", name.c_str());
+            return false;
+        }
+        smoothNames.erase(name);
+        saveFilters();
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Moved %s to the Recycle Bin", name.c_str());
         return true;
     }
 

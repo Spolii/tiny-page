@@ -11,58 +11,97 @@
 
 struct Entity {
     std::string  name;
-    float        x = 0, y = 0;   // keep x and y together: the Inspector edits them as a pair
-    float        rotation = 0;   // degrees, clockwise
-    std::string  sprite;         // asset name (see AssetStore), empty = none
+    float        x = 0, y = 0;    // the CENTER of the object; keep x and y together (Inspector edits them as a pair)
+    float        rotation = 0;    // degrees, clockwise
+    float        sx = 1, sy = 1;  // scale; keep sx and sy together
+    std::string  sprite;          // asset name (see AssetStore), empty = none
 
     bool operator==(const Entity&) const = default;
 };
 
 struct Scene {
     std::vector<Entity> entities;
-    int selected = -1;
-    const AssetStore* assets = nullptr;   // where sprites come from
+    std::vector<int>    selection;   // indices into `entities`, ascending
+    int                 active = -1; // the one the Inspector shows (always inside `selection`)
+    const AssetStore*   assets = nullptr;
+
+    // ---- selection ----
+    bool hasSelection() const { return !selection.empty(); }
+    bool isSelected(int i) const { return std::binary_search(selection.begin(), selection.end(), i); }
+
+    void select(int i) {
+        selection.clear();
+        active = -1;
+        if (valid(i)) { selection.push_back(i); active = i; }
+    }
+
+    void toggle(int i) {
+        if (!valid(i)) return;
+        auto it = std::lower_bound(selection.begin(), selection.end(), i);
+        if (it != selection.end() && *it == i) {
+            selection.erase(it);
+            if (active == i) active = selection.empty() ? -1 : selection.back();
+        } else {
+            selection.insert(it, i);
+            active = i;
+        }
+    }
+
+    void selectRange(int a, int b) {
+        if (!valid(a)) { select(b); return; }
+        selection.clear();
+        for (int i = std::min(a, b); i <= std::max(a, b); ++i) selection.push_back(i);
+        active = b;
+    }
+
+    void selectAll() {
+        selection.clear();
+        for (int i = 0; i < int(entities.size()); ++i) selection.push_back(i);
+        active = selection.empty() ? -1 : selection.back();
+    }
+
+    // Replace the selection (duplicates and bad indices are dropped)
+    void setSelection(std::vector<int> s, int prefer = -1) {
+        std::sort(s.begin(), s.end());
+        s.erase(std::unique(s.begin(), s.end()), s.end());
+        std::erase_if(s, [&](int i) { return !valid(i); });
+        selection = std::move(s);
+        active = isSelected(prefer) ? prefer : (selection.empty() ? -1 : selection.back());
+    }
 
     // ---- editing ----
     void add(std::string name, float x, float y, std::string sprite) {
-        entities.push_back({std::move(name), x, y, 0.0f, std::move(sprite)});
+        entities.push_back({std::move(name), x, y, 0.0f, 1.0f, 1.0f, std::move(sprite)});
     }
 
-    bool hasSelection() const { return selected >= 0 && selected < int(entities.size()); }
-
     void removeSelected() {
-        if (!hasSelection()) return;
-        entities.erase(entities.begin() + selected);
-        selected = -1;
+        for (auto it = selection.rbegin(); it != selection.rend(); ++it)
+            entities.erase(entities.begin() + *it);
+        select(-1);
     }
 
     void duplicateSelected() {
-        if (!hasSelection()) return;
-        Entity copy = entities[selected];
-        copy.name += " Copy";
-        copy.x += 8;
-        copy.y += 8;
-        entities.push_back(copy);
-        selected = int(entities.size()) - 1;
+        std::vector<int> created;
+        for (int i : selection) {
+            Entity copy = entities[i];
+            copy.name += " Copy";
+            copy.x += 8;
+            copy.y += 8;
+            entities.push_back(copy);
+            created.push_back(int(entities.size()) - 1);
+        }
+        if (!created.empty()) setSelection(created, created.back());
     }
 
     // Entities are drawn in list order: the last one is on top
-    void bringToFront() {
-        if (!hasSelection()) return;
-        std::rotate(entities.begin() + selected, entities.begin() + selected + 1, entities.end());
-        selected = int(entities.size()) - 1;
-    }
+    void bringToFront() { reorder(true); }
+    void sendToBack()   { reorder(false); }
 
-    void sendToBack() {
-        if (!hasSelection()) return;
-        std::rotate(entities.begin(), entities.begin() + selected, entities.begin() + selected + 1);
-        selected = 0;
-    }
-
-    // Unrotated box in scene units
+    // Box in scene units, unrotated (position is the center)
     SDL_FRect bounds(const Entity& e) const {
         const SDL_FPoint s = assets ? assets->size(e.sprite) : SDL_FPoint{16, 16};
-        return {std::round(e.x), std::round(e.y), s.x, s.y};
+        const float w = s.x * e.sx, h = s.y * e.sy;
+        return {std::round(e.x - w / 2), std::round(e.y - h / 2), w, h};
     }
 
     // Rotate a vector clockwise (y points down, like SDL)
@@ -72,7 +111,7 @@ struct Scene {
         return {dx * c - dy * s, dx * s + dy * c};
     }
 
-    // Topmost entity under a scene-space point (respects rotation), or -1
+    // Topmost entity under a scene-space point (respects rotation and scale), or -1
     int pick(float x, float y) const {
         for (int i = int(entities.size()) - 1; i >= 0; --i) {
             const SDL_FRect  b = bounds(entities[i]);
@@ -82,18 +121,37 @@ struct Scene {
         return -1;
     }
 
+    // Every entity that touches a scene-space rectangle
+    std::vector<int> inRect(float x0, float y0, float x1, float y1) const {
+        std::vector<int> hits;
+        for (int i = 0; i < int(entities.size()); ++i) {
+            const Entity&   e = entities[i];
+            const SDL_FRect b = bounds(e);
+            const float cx = b.x + b.w / 2, cy = b.y + b.h / 2;
+            float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
+            for (float kx : {-0.5f, 0.5f})
+                for (float ky : {-0.5f, 0.5f}) {
+                    const SDL_FPoint q = rotate(kx * b.w, ky * b.h, e.rotation);
+                    minX = std::min(minX, cx + q.x);  maxX = std::max(maxX, cx + q.x);
+                    minY = std::min(minY, cy + q.y);  maxY = std::max(maxY, cy + q.y);
+                }
+            if (maxX >= x0 && minX <= x1 && maxY >= y0 && minY <= y1) hits.push_back(i);
+        }
+        return hits;
+    }
+
     // `scale` = render pixels per scene unit
     void draw(SDL_Renderer* r, float scale) const {
         for (int i = 0; i < int(entities.size()); ++i) {
-            const Entity&   e   = entities[i];
-            const SDL_FRect b   = bounds(e);
+            const Entity&   e = entities[i];
+            const SDL_FRect b = bounds(e);
             const SDL_FRect dst{b.x * scale, b.y * scale, b.w * scale, b.h * scale};
             SDL_Texture* tex = assets ? assets->texture(e.sprite) : nullptr;
 
             if (tex) SDL_RenderTextureRotated(r, tex, nullptr, &dst, e.rotation, nullptr, SDL_FLIP_NONE);
             else     quad(r, dst, e.rotation, 0, e.sprite.empty() ? UI::dim : UI::error);   // no sprite / missing asset
 
-            if (i == selected) {
+            if (isSelected(i)) {
                 quad(r, dst, e.rotation, 1, UI::accent);
                 quad(r, dst, e.rotation, 2, UI::accent);
             }
@@ -127,7 +185,7 @@ struct Scene {
         entities = undoStack.back();
         undoStack.pop_back();
         baseline = entities;
-        clampSelection();
+        setSelection(selection, active);
     }
 
     void redo() {
@@ -137,10 +195,32 @@ struct Scene {
         entities = redoStack.back();
         redoStack.pop_back();
         baseline = entities;
-        clampSelection();
+        setSelection(selection, active);
     }
 
 private:
+    bool valid(int i) const { return i >= 0 && i < int(entities.size()); }
+
+    // Move the selected entities to the end (front) or the start (back), keeping their order
+    void reorder(bool front) {
+        if (!hasSelection()) return;
+        std::vector<Entity> rest, picked;
+        for (int i = 0; i < int(entities.size()); ++i)
+            (isSelected(i) ? picked : rest).push_back(entities[i]);
+
+        const int rank  = int(std::find(selection.begin(), selection.end(), active) - selection.begin());
+        const int start = front ? int(rest.size()) : 0;
+
+        std::vector<Entity> all = front ? rest : picked;
+        const std::vector<Entity>& tail = front ? picked : rest;
+        all.insert(all.end(), tail.begin(), tail.end());
+        entities = std::move(all);
+
+        selection.clear();
+        for (int k = 0; k < int(picked.size()); ++k) selection.push_back(start + k);
+        active = start + rank;
+    }
+
     // A rotated rectangle outline, `grow` pixels outside the box
     static void quad(SDL_Renderer* r, const SDL_FRect& d, float degrees, float grow, SDL_Color c) {
         UI::color(r, c);
@@ -154,10 +234,6 @@ private:
         }
         pts[4] = pts[0];
         SDL_RenderLines(r, pts, 5);
-    }
-
-    void clampSelection() {
-        if (selected >= int(entities.size())) selected = -1;
     }
 
     std::vector<Entity>              baseline;
