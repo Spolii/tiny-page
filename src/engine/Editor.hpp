@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include "AssetStore.hpp"
 #include "Scene.hpp"
 #include "core/Assets.hpp"
 #include "core/Log.hpp"
@@ -21,7 +22,7 @@ class Editor {
 public:
     bool wantsQuit = false;
 
-    explicit Editor(Window& w) : win(w), r(w.renderer) {
+    explicit Editor(Window& w) : win(w), r(w.renderer), assets(w.renderer) {
         SDL_SetRenderVSync(r, 1);
 
         IMGUI_CHECKVERSION();
@@ -34,12 +35,15 @@ public:
         logIcons[0] = loadTexture(r, "info.png");
         logIcons[1] = loadTexture(r, "warning.png");
         logIcons[2] = loadTexture(r, "error.png");
-        spriteIcon  = loadTexture(r, "icon.png");
 
-        scene.add("Icon",    40,  40, spriteIcon);
-        scene.add("Info",   120,  60, logIcons[0]);
-        scene.add("Warning", 200,  90, logIcons[1]);
-        scene.add("Error",  120, 130, logIcons[2]);
+        // Demo objects, for whichever of these assets exist in project/assets
+        scene.assets = &assets;
+        const struct { const char* name; const char* sprite; float x, y; } demo[] = {
+            {"Icon", "icon.png", 40, 40}, {"Info", "info.png", 120, 60},
+            {"Warning", "warning.png", 200, 90}, {"Error", "error.png", 120, 130},
+        };
+        for (const auto& d : demo)
+            if (assets.find(d.sprite)) scene.add(d.name, d.x, d.y, d.sprite);
         scene.resetHistory();
     }
 
@@ -49,9 +53,19 @@ public:
         ImGui::DestroyContext();
     }
 
-    void handleEvent(const SDL_Event& e) { ImGui_ImplSDL3_ProcessEvent(&e); }
+    void handleEvent(const SDL_Event& e) {
+        ImGui_ImplSDL3_ProcessEvent(&e);
+        if (e.type == SDL_EVENT_DROP_FILE && assets.importFile(e.drop.data)) refreshAssets = true;
+        if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED) refreshAssets = true;
+    }
 
     void frame() {
+        // Safe moment to reload textures: nothing from this frame references them yet
+        if (refreshAssets) {
+            assets.refresh();
+            refreshAssets = false;
+        }
+
         // 1. Build the UI
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
@@ -123,6 +137,13 @@ private:
         dragCursor();
     }
 
+    // Shorten a name with ".." so it fits in `width` pixels
+    static std::string fitText(std::string s, float width) {
+        if (ImGui::CalcTextSize(s.c_str()).x <= width) return s;
+        while (s.size() > 1 && ImGui::CalcTextSize((s + "..").c_str()).x > width) s.pop_back();
+        return s + "..";
+    }
+
     void applyStyle() {
         ImGuiStyle& s = ImGui::GetStyle();
         s.WindowRounding = s.ChildRounding = s.PopupRounding = s.FrameRounding = 0;
@@ -161,6 +182,7 @@ private:
         c[ImGuiCol_Tab]                  = col(UI::bg);
         c[ImGuiCol_TabHovered]           = col(UI::accent, 0.60f);
         c[ImGuiCol_TabSelected]          = col(UI::button);
+        c[ImGuiCol_DragDropTarget]       = col(UI::accent);
     }
 
     // The scene texture is viewW*s by viewH*s pixels, so it is shown 1:1 (no resampling)
@@ -186,12 +208,17 @@ private:
         renameFocus = true;
     }
 
-    void addObject(float x, float y) {
-        scene.add("Object", std::round(x), std::round(y), spriteIcon);
+    // `sprite` is an asset name; empty = an object without a sprite
+    void addObject(float x, float y, const std::string& sprite = {}) {
+        const std::string name = sprite.empty() ? "Object" : fs::path(sprite).stem().string();
+        scene.add(name, std::round(x), std::round(y), sprite);
         scene.selected = int(scene.entities.size()) - 1;
     }
 
-    void addObjectAtCenter() { addObject(viewW / 2.0f - 8, viewH / 2.0f - 8); }
+    void addObjectAtCenter(const std::string& sprite = {}) {
+        const SDL_FPoint s = assets.size(sprite);
+        addObject(viewW / 2.0f - s.x / 2, viewH / 2.0f - s.y / 2, sprite);
+    }
 
     // The one menu every right-click on an object uses
     void entityMenu() {
@@ -296,6 +323,7 @@ private:
             ImGui::SetCursorScreenPos(origin);
             ImGui::InvisibleButton("viewport", size);
             dragInScene(origin, float(s));
+            sceneDrop(origin, float(s));
             sceneMenu(origin, float(s));
         }
         ImGui::End();
@@ -326,6 +354,18 @@ private:
             ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
     }
 
+    // An asset dropped on the Scene becomes an object under the mouse
+    void sceneDrop(ImVec2 origin, float s) {
+        if (!ImGui::BeginDragDropTarget()) return;
+        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ASSET")) {
+            const std::string  name = static_cast<const char*>(p->Data);
+            const SDL_FPoint   size = assets.size(name);
+            const ImVec2       m    = ImGui::GetMousePos();
+            addObject((m.x - origin.x) / s - size.x / 2, (m.y - origin.y) / s - size.y / 2, name);
+        }
+        ImGui::EndDragDropTarget();
+    }
+
     // Right-click in the Scene: select what is under the mouse, then show the menu
     void sceneMenu(ImVec2 origin, float s) {
         if (ImGui::IsItemClicked(ImGuiMouseButton_Right)) {
@@ -341,6 +381,21 @@ private:
         }
     }
 
+    // Pick an asset from a list, or drop one from the Assets panel
+    void spriteField(Entity& e) {
+        if (ImGui::BeginCombo("Sprite", e.sprite.empty() ? "None" : e.sprite.c_str())) {
+            if (ImGui::Selectable("None", e.sprite.empty())) e.sprite.clear();
+            for (const Asset& a : assets.all())
+                if (ImGui::Selectable(a.name.c_str(), a.name == e.sprite)) e.sprite = a.name;
+            ImGui::EndCombo();
+        }
+        if (ImGui::BeginDragDropTarget()) {
+            if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("ASSET"))
+                e.sprite = static_cast<const char*>(p->Data);
+            ImGui::EndDragDropTarget();
+        }
+    }
+
     void inspector(float x, float y, float w, float h) {
         if (panel("Inspector", x, y, w, h)) {
             if (scene.hasSelection()) {
@@ -348,6 +403,7 @@ private:
                 ImGui::InputText("Name", &e.name);
                 dragFloat2("Position", &e.x);
                 dragFloat("Rotation", &e.rotation);
+                spriteField(e);
                 ImGui::Separator();
                 if (ImGui::Button("Delete")) deleteSelected();
             } else {
@@ -374,7 +430,7 @@ private:
                 ImGui::EndTabItem();
             }
             if (ImGui::BeginTabItem("Assets")) {
-                ImGui::TextDisabled("Nothing here yet");
+                assetsTab();
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -400,14 +456,79 @@ private:
         ImGui::EndChild();
     }
 
+    void assetsTab() {
+        if (ImGui::Button("Refresh")) refreshAssets = true;
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", assets.folder().c_str());
+
+        ImGui::BeginChild("assetGrid");
+        const auto& list = assets.all();
+        if (list.empty())
+            ImGui::TextDisabled("No PNG files yet. Drop PNGs onto this window or copy them into the folder above.");
+
+        const float thumb   = 64;
+        const float gap     = ImGui::GetStyle().ItemSpacing.x;
+        const int   columns = std::max(1, int((ImGui::GetContentRegionAvail().x + gap) / (thumb + gap)));
+
+        for (int i = 0; i < int(list.size()); ++i) {
+            ImGui::PushID(i);
+            assetCell(list[i], thumb);
+            ImGui::PopID();
+            if ((i + 1) % columns != 0 && i + 1 < int(list.size())) ImGui::SameLine();
+        }
+        ImGui::EndChild();
+    }
+
+    // One thumbnail: drag it into the Scene, right-click for options
+    void assetCell(const Asset& a, float thumb) {
+        float tw = 16, th = 16;
+        SDL_GetTextureSize(a.texture, &tw, &th);
+        float sc = std::min(thumb / tw, thumb / th);
+        if (sc >= 1) sc = std::floor(sc);   // whole-number zoom keeps pixel art crisp
+        const ImVec2 size(tw * sc, th * sc);
+
+        ImGui::BeginGroup();
+        ImGui::InvisibleButton("cell", {thumb, thumb});
+        const bool   hovered = ImGui::IsItemHovered();
+        const ImVec2 p0 = ImGui::GetItemRectMin(), p1 = ImGui::GetItemRectMax();
+        const ImVec2 q0(std::floor(p0.x + (thumb - size.x) / 2), std::floor(p0.y + (thumb - size.y) / 2));
+
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(p0, p1, ImGui::GetColorU32(col(UI::bg)));
+        dl->AddImage(tid(a.texture), q0, {q0.x + size.x, q0.y + size.y});
+        dl->AddRect(p0, p1, ImGui::GetColorU32(col(hovered ? UI::accent : UI::border)));
+
+        if (ImGui::BeginDragDropSource()) {
+            ImGui::SetDragDropPayload("ASSET", a.name.c_str(), a.name.size() + 1);
+            ImGui::Image(tid(a.texture), {size.x * 0.5f, size.y * 0.5f});
+            ImGui::TextUnformatted(a.name.c_str());
+            ImGui::EndDragDropSource();
+        }
+
+        if (ImGui::BeginPopupContextItem("assetMenu", rightClick)) {
+            if (ImGui::MenuItem("Add to Scene")) addObjectAtCenter(a.name);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Pixel filter (crisp)", nullptr, !a.smooth)) assets.setSmooth(a.name, false);
+            if (ImGui::MenuItem("Smooth filter",        nullptr,  a.smooth)) assets.setSmooth(a.name, true);
+            ImGui::EndPopup();
+        }
+
+        if (hovered && !ImGui::GetDragDropPayload())
+            ImGui::SetTooltip("%s\n%d x %d  (%s)", a.name.c_str(), int(tw), int(th), a.smooth ? "Smooth" : "Pixel");
+
+        ImGui::TextUnformatted(fitText(fs::path(a.name).filename().string(), thumb).c_str());
+        ImGui::EndGroup();
+    }
+
     Window&       win;
     SDL_Renderer* r;
+    AssetStore    assets;
     SDL_Texture*  view        = nullptr;
     int           viewScale   = 0;
     SDL_Texture*  logIcons[3] = {};
-    SDL_Texture*  spriteIcon  = nullptr;
     Scene         scene;
     size_t        lastLogCount = 0;
+    bool          refreshAssets = false;
 
     int   renaming    = -1;      // Hierarchy row being renamed
     bool  renameFocus = false;

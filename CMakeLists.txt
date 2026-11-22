@@ -36,7 +36,10 @@ target_include_directories(tiny-page PRIVATE src)
 target_link_libraries(tiny-page PRIVATE SDL3::SDL3 imgui)
 target_link_options(tiny-page PRIVATE -static)
 
-# Copy assets next to the exe
+# The game project (sprites etc.) lives in the repo, not next to the exe
+target_compile_definitions(tiny-page PRIVATE PROJECT_DIR="${CMAKE_SOURCE_DIR}/project")
+
+# Copy the editor's own assets next to the exe
 add_custom_command(TARGET tiny-page POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
             ${CMAKE_SOURCE_DIR}/src/assets

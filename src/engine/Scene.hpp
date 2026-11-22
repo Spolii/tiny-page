@@ -6,13 +6,14 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "AssetStore.hpp"
 #include "core/UI.hpp"
 
 struct Entity {
     std::string  name;
     float        x = 0, y = 0;   // keep x and y together: the Inspector edits them as a pair
     float        rotation = 0;   // degrees, clockwise
-    SDL_Texture* sprite = nullptr;
+    std::string  sprite;         // asset name (see AssetStore), empty = none
 
     bool operator==(const Entity&) const = default;
 };
@@ -20,10 +21,11 @@ struct Entity {
 struct Scene {
     std::vector<Entity> entities;
     int selected = -1;
+    const AssetStore* assets = nullptr;   // where sprites come from
 
     // ---- editing ----
-    void add(std::string name, float x, float y, SDL_Texture* sprite) {
-        entities.push_back({std::move(name), x, y, 0.0f, sprite});
+    void add(std::string name, float x, float y, std::string sprite) {
+        entities.push_back({std::move(name), x, y, 0.0f, std::move(sprite)});
     }
 
     bool hasSelection() const { return selected >= 0 && selected < int(entities.size()); }
@@ -58,10 +60,9 @@ struct Scene {
     }
 
     // Unrotated box in scene units
-    static SDL_FRect bounds(const Entity& e) {
-        float w = 16, h = 16;
-        if (e.sprite) SDL_GetTextureSize(e.sprite, &w, &h);
-        return {std::round(e.x), std::round(e.y), w, h};
+    SDL_FRect bounds(const Entity& e) const {
+        const SDL_FPoint s = assets ? assets->size(e.sprite) : SDL_FPoint{16, 16};
+        return {std::round(e.x), std::round(e.y), s.x, s.y};
     }
 
     // Rotate a vector clockwise (y points down, like SDL)
@@ -84,11 +85,18 @@ struct Scene {
     // `scale` = render pixels per scene unit
     void draw(SDL_Renderer* r, float scale) const {
         for (int i = 0; i < int(entities.size()); ++i) {
-            const Entity&   e = entities[i];
-            const SDL_FRect b = bounds(e);
+            const Entity&   e   = entities[i];
+            const SDL_FRect b   = bounds(e);
             const SDL_FRect dst{b.x * scale, b.y * scale, b.w * scale, b.h * scale};
-            if (e.sprite) SDL_RenderTextureRotated(r, e.sprite, nullptr, &dst, e.rotation, nullptr, SDL_FLIP_NONE);
-            if (i == selected) outline(r, dst, e.rotation);
+            SDL_Texture* tex = assets ? assets->texture(e.sprite) : nullptr;
+
+            if (tex) SDL_RenderTextureRotated(r, tex, nullptr, &dst, e.rotation, nullptr, SDL_FLIP_NONE);
+            else     quad(r, dst, e.rotation, 0, e.sprite.empty() ? UI::dim : UI::error);   // no sprite / missing asset
+
+            if (i == selected) {
+                quad(r, dst, e.rotation, 1, UI::accent);
+                quad(r, dst, e.rotation, 2, UI::accent);
+            }
         }
     }
 
@@ -133,21 +141,19 @@ struct Scene {
     }
 
 private:
-    // Rotated selection box, 2 pixels thick
-    static void outline(SDL_Renderer* r, const SDL_FRect& d, float degrees) {
-        UI::color(r, UI::accent);
+    // A rotated rectangle outline, `grow` pixels outside the box
+    static void quad(SDL_Renderer* r, const SDL_FRect& d, float degrees, float grow, SDL_Color c) {
+        UI::color(r, c);
         const float cx = d.x + d.w / 2, cy = d.y + d.h / 2;
-        for (float grow : {1.0f, 2.0f}) {
-            const float hw = d.w / 2 + grow, hh = d.h / 2 + grow;
-            const SDL_FPoint corners[4] = {{-hw, -hh}, {hw, -hh}, {hw, hh}, {-hw, hh}};
-            SDL_FPoint pts[5];
-            for (int k = 0; k < 4; ++k) {
-                const SDL_FPoint q = rotate(corners[k].x, corners[k].y, degrees);
-                pts[k] = {cx + q.x, cy + q.y};
-            }
-            pts[4] = pts[0];
-            SDL_RenderLines(r, pts, 5);
+        const float hw = d.w / 2 + grow, hh = d.h / 2 + grow;
+        const SDL_FPoint corners[4] = {{-hw, -hh}, {hw, -hh}, {hw, hh}, {-hw, hh}};
+        SDL_FPoint pts[5];
+        for (int k = 0; k < 4; ++k) {
+            const SDL_FPoint q = rotate(corners[k].x, corners[k].y, degrees);
+            pts[k] = {cx + q.x, cy + q.y};
         }
+        pts[4] = pts[0];
+        SDL_RenderLines(r, pts, 5);
     }
 
     void clampSelection() {
