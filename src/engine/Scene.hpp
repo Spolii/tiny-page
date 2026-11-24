@@ -3,19 +3,53 @@
 #include <algorithm>
 #include <cmath>
 #include <numbers>
+#include <numeric>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include "AssetStore.hpp"
 #include "core/UI.hpp"
 
+// A script variable shown in the Inspector (declared in the script with public("name", default))
+struct Var {
+    std::string name;
+    char        type   = 'n';   // 'n' number, 'b' boolean, 's' text
+    float       number = 0;     // numbers, and booleans as 0 / 1
+    std::string text;
+
+    bool operator==(const Var&) const = default;
+};
+
+inline const Var* findVar(const std::vector<Var>& vars, std::string_view name) {
+    for (const Var& v : vars) if (v.name == name) return &v;
+    return nullptr;
+}
+
+inline void setVar(std::vector<Var>& vars, const Var& value) {
+    for (Var& v : vars) if (v.name == value.name) { v = value; return; }
+    vars.push_back(value);
+}
+
 struct Entity {
-    std::string  name;
-    float        x = 0, y = 0;    // the CENTER of the object; keep x and y together (Inspector edits them as a pair)
-    float        rotation = 0;    // degrees, clockwise
-    float        sx = 1, sy = 1;  // scale; keep sx and sy together
-    std::string  sprite;          // asset name (see AssetStore), empty = none
-    std::string  script;          // asset name of a .lua file, empty = none
+    std::string name;
+
+    // Transform
+    float x = 0, y = 0;     // the CENTER of the object; keep x and y together (the Inspector edits them as a pair)
+    float rotation = 0;     // degrees, clockwise
+    float sx = 1, sy = 1;   // scale; keep sx and sy together
+
+    // Sprite Renderer
+    bool        visible = true;
+    std::string sprite;                   // asset name (see AssetStore), empty = none
+    bool        flipX = false, flipY = false;
+    int         front  = 0;               // which side of the artwork is the front: 0 right, 1 up, 2 left, 3 down
+    int         zIndex = 0;               // higher = drawn on top
+    float       tint[4] = {1, 1, 1, 1};   // red, green, blue, alpha (0..1)
+
+    // Script
+    std::string      script;              // asset name of a .lua file, empty = none
+    std::vector<Var> vars;                // values of the script's public variables that were changed
 
     bool operator==(const Entity&) const = default;
 };
@@ -72,7 +106,12 @@ struct Scene {
 
     // ---- editing ----
     void add(std::string name, float x, float y, std::string sprite) {
-        entities.push_back({std::move(name), x, y, 0.0f, 1.0f, 1.0f, std::move(sprite)});
+        Entity e;
+        e.name   = std::move(name);
+        e.x      = x;
+        e.y      = y;
+        e.sprite = std::move(sprite);
+        entities.push_back(std::move(e));
     }
 
     void removeSelected() {
@@ -94,10 +133,6 @@ struct Scene {
         if (!created.empty()) setSelection(created, created.back());
     }
 
-    // Entities are drawn in list order: the last one is on top
-    void bringToFront() { reorder(true); }
-    void sendToBack()   { reorder(false); }
-
     // Box in scene units, unrotated (position is the center)
     SDL_FRect bounds(const Entity& e) const {
         const SDL_FPoint s = assets ? assets->size(e.sprite) : SDL_FPoint{16, 16};
@@ -112,12 +147,34 @@ struct Scene {
         return {dx * c - dy * s, dx * s + dy * c};
     }
 
-    // Topmost entity under a scene-space point (respects rotation and scale), or -1
+    // The direction the front of the sprite points in (a unit vector): the chosen front side,
+    // mirrored by the flips, then turned by the rotation
+    static SDL_FPoint look(const Entity& e) {
+        static constexpr SDL_FPoint sides[4] = {{1, 0}, {0, -1}, {-1, 0}, {0, 1}};
+        SDL_FPoint f = sides[std::clamp(e.front, 0, 3)];
+        if (e.flipX) f.x = -f.x;
+        if (e.flipY) f.y = -f.y;
+        return rotate(f.x, f.y, e.rotation);
+    }
+
+    // Indices from the bottom-most to the top-most entity (Z-Index, then list order)
+    std::vector<int> drawOrder() const {
+        std::vector<int> order(entities.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int a, int b) { return entities[a].zIndex < entities[b].zIndex; });
+        return order;
+    }
+
+    // Topmost visible entity under a scene-space point (respects rotation and scale), or -1
     int pick(float x, float y) const {
-        for (int i = int(entities.size()) - 1; i >= 0; --i) {
-            const SDL_FRect  b = bounds(entities[i]);
-            const SDL_FPoint p = rotate(x - (b.x + b.w / 2), y - (b.y + b.h / 2), -entities[i].rotation);
-            if (std::abs(p.x) <= b.w / 2 && std::abs(p.y) <= b.h / 2) return i;
+        const std::vector<int> order = drawOrder();
+        for (auto it = order.rbegin(); it != order.rend(); ++it) {
+            const Entity&   e = entities[*it];
+            if (!e.visible) continue;
+            const SDL_FRect  b = bounds(e);
+            const SDL_FPoint p = rotate(x - (b.x + b.w / 2), y - (b.y + b.h / 2), -e.rotation);
+            if (std::abs(p.x) <= b.w / 2 && std::abs(p.y) <= b.h / 2) return *it;
         }
         return -1;
     }
@@ -143,19 +200,31 @@ struct Scene {
 
     // `scale` = render pixels per scene unit
     void draw(SDL_Renderer* r, float scale) const {
-        for (int i = 0; i < int(entities.size()); ++i) {
-            const Entity&   e = entities[i];
-            const SDL_FRect b = bounds(e);
-            const SDL_FRect dst{b.x * scale, b.y * scale, b.w * scale, b.h * scale};
+        for (int i : drawOrder()) {
+            const Entity& e = entities[i];
+            if (!e.visible) continue;
+            const SDL_FRect dst = toPixels(bounds(e), scale);
             SDL_Texture* tex = assets ? assets->texture(e.sprite) : nullptr;
 
-            if (tex) SDL_RenderTextureRotated(r, tex, nullptr, &dst, e.rotation, nullptr, SDL_FLIP_NONE);
-            else     quad(r, dst, e.rotation, 0, e.sprite.empty() ? UI::dim : UI::error);   // no sprite / missing asset
-
-            if (isSelected(i)) {
-                quad(r, dst, e.rotation, 1, UI::accent);
-                quad(r, dst, e.rotation, 2, UI::accent);
+            if (tex) {
+                SDL_SetTextureColorModFloat(tex, e.tint[0], e.tint[1], e.tint[2]);
+                SDL_SetTextureAlphaModFloat(tex, e.tint[3]);
+                SDL_RenderTextureRotated(r, tex, nullptr, &dst, e.rotation, nullptr, flipOf(e));
+                SDL_SetTextureColorModFloat(tex, 1, 1, 1);   // the Assets panel shares this texture
+                SDL_SetTextureAlphaModFloat(tex, 1);
+            } else {
+                quad(r, dst, e.rotation, 0, e.sprite.empty() ? UI::dim : UI::error);   // no sprite / missing asset
             }
+        }
+
+        // Selection boxes and the front arrow go on top of everything
+        for (int i = 0; i < int(entities.size()); ++i) {
+            if (!isSelected(i)) continue;
+            const Entity&   e   = entities[i];
+            const SDL_FRect dst = toPixels(bounds(e), scale);
+            quad(r, dst, e.rotation, 1, UI::accent);
+            quad(r, dst, e.rotation, 2, UI::accent);
+            arrow(r, dst, look(e), UI::warn);
         }
     }
 
@@ -220,24 +289,13 @@ struct Scene {
 private:
     bool valid(int i) const { return i >= 0 && i < int(entities.size()); }
 
-    // Move the selected entities to the end (front) or the start (back), keeping their order
-    void reorder(bool front) {
-        if (!hasSelection()) return;
-        std::vector<Entity> rest, picked;
-        for (int i = 0; i < int(entities.size()); ++i)
-            (isSelected(i) ? picked : rest).push_back(entities[i]);
+    static SDL_FRect toPixels(const SDL_FRect& b, float scale) {
+        return {b.x * scale, b.y * scale, b.w * scale, b.h * scale};
+    }
 
-        const int rank  = int(std::find(selection.begin(), selection.end(), active) - selection.begin());
-        const int start = front ? int(rest.size()) : 0;
-
-        std::vector<Entity> all = front ? rest : picked;
-        const std::vector<Entity>& tail = front ? picked : rest;
-        all.insert(all.end(), tail.begin(), tail.end());
-        entities = std::move(all);
-
-        selection.clear();
-        for (int k = 0; k < int(picked.size()); ++k) selection.push_back(start + k);
-        active = start + rank;
+    static SDL_FlipMode flipOf(const Entity& e) {
+        return static_cast<SDL_FlipMode>((e.flipX ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE) |
+                                         (e.flipY ? SDL_FLIP_VERTICAL : SDL_FLIP_NONE));
     }
 
     // A rotated rectangle outline, `grow` pixels outside the box
@@ -252,6 +310,18 @@ private:
             pts[k] = {cx + q.x, cy + q.y};
         }
         pts[4] = pts[0];
+        SDL_RenderLines(r, pts, 5);
+    }
+
+    // A line from the center of the box in direction `dir`, with an arrow head
+    static void arrow(SDL_Renderer* r, const SDL_FRect& d, SDL_FPoint dir, SDL_Color c) {
+        UI::color(r, c);
+        const float      len = std::max(d.w, d.h) / 2 + 10;
+        const SDL_FPoint from{d.x + d.w / 2, d.y + d.h / 2};
+        const SDL_FPoint tip{from.x + dir.x * len, from.y + dir.y * len};
+        const SDL_FPoint a = rotate(-dir.x * 6, -dir.y * 6, 30);
+        const SDL_FPoint b = rotate(-dir.x * 6, -dir.y * 6, -30);
+        const SDL_FPoint pts[5] = {from, tip, {tip.x + a.x, tip.y + a.y}, tip, {tip.x + b.x, tip.y + b.y}};
         SDL_RenderLines(r, pts, 5);
     }
 

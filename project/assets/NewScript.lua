@@ -1,11 +1,11 @@
--- self has: x, y, rotation, scale_x, scale_y, name
--- helpers: log("text"), key_down("Left")
+public("speed", 40)
+public("turn_speed", 90)
+public("moving", true)
 
--- Runs once when Play starts
-function start(self)
-end
-
--- Runs every frame while playing. dt = seconds since the last frame
 function update(self, dt)
-    self.rotation = self.rotation + 120 * dt
+    self.rotation = self.rotation + self.turn_speed * dt
+    if self.moving then
+        self.x = self.x + self.look_x * self.speed * dt
+        self.y = self.y + self.look_y * self.speed * dt
+    end
 end

@@ -8,6 +8,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -165,6 +166,11 @@ private:
         dragCursor();
         return changed;
     }
+    static bool dragInt(const char* label, int* v, float speed = 0.2f) {
+        const bool changed = ImGui::DragInt(label, v, speed);
+        dragCursor();
+        return changed;
+    }
 
     // A square button with a small pixel icon (play, pause, stop, lock)
     static bool iconButton(const char* id, Icon icon, bool active = false, bool enabled = true,
@@ -281,7 +287,7 @@ private:
     }
 
     // ---- play mode ----
-    // While playing, scripts own the objects: adding, deleting, reordering and undo are off.
+    // While playing, scripts own the objects: adding, deleting and undo are off.
     bool editing() const { return mode == Mode::Stopped; }
 
     void play() {
@@ -311,8 +317,6 @@ private:
     void redo()              { if (editing()) { scene.redo(); renaming = -1; } }
     void deleteSelected()    { if (editing()) { scene.removeSelected(); renaming = -1; } }
     void duplicateSelected() { if (editing()) { scene.duplicateSelected(); renaming = -1; } }
-    void bringToFront()      { if (editing()) { scene.bringToFront(); renaming = -1; } }
-    void sendToBack()        { if (editing()) { scene.sendToBack(); renaming = -1; } }
 
     void startRename() {
         if (!scene.hasSelection()) return;
@@ -348,10 +352,7 @@ private:
         ImGui::BeginDisabled(!editing());
         if (ImGui::MenuItem("Duplicate", "Ctrl+D")) duplicateSelected();
         ImGui::Separator();
-        if (ImGui::MenuItem("Bring to Front")) bringToFront();
-        if (ImGui::MenuItem("Send to Back"))   sendToBack();
-        ImGui::Separator();
-        if (ImGui::MenuItem("Delete", "Del"))  deleteSelected();
+        if (ImGui::MenuItem("Delete", "Del")) deleteSelected();
         ImGui::EndDisabled();
     }
 
@@ -602,42 +603,123 @@ private:
         return changed;
     }
 
+    void transformFields(Entity& e) {
+        dragFloat2("Position", &e.x);
+        dragFloat("Rotation", &e.rotation);
+
+        // Scale, with a lock that keeps X and Y equal
+        if (iconButton("scaleLock", scaleLocked ? Icon::Lock : Icon::Unlock, scaleLocked, true,
+                       scaleLocked ? "X and Y change together" : "Click to link X and Y")) {
+            scaleLocked = !scaleLocked;
+            if (scaleLocked) forSelected([](Entity& o) { o.sy = o.sx; });
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ImGui::CalcItemWidth() - ImGui::GetFrameHeight() - ImGui::GetStyle().ItemSpacing.x);
+        const float ox = e.sx;
+        if (dragFloat2("Scale", &e.sx, 0.02f, 0.05f, 50.0f, "%.2f") && scaleLocked) {
+            if (e.sx != ox) e.sy = e.sx;
+            else            e.sx = e.sy;
+        }
+    }
+
+    void rendererFields(Entity& e) {
+        ImGui::Checkbox("Enabled", &e.visible);
+        assetField("Sprite", e.sprite, false);
+
+        ImGui::Checkbox("Flip X", &e.flipX);
+        ImGui::SameLine();
+        ImGui::Checkbox("Flip Y", &e.flipY);
+
+        static const char* const sides[] = {"Right", "Up", "Left", "Down"};
+        ImGui::Combo("Front", &e.front, sides, 4);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Which side of the artwork is its front.\nScripts get it as look_x / look_y.\nThe yellow arrow in the Scene shows it.");
+
+        dragInt("Z-Index", &e.zIndex);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Higher numbers are drawn on top.");
+
+        ImGui::ColorEdit4("Tint", e.tint, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaPreviewHalf);
+    }
+
+    // The script's public variables: one field each, set on every selected object that uses the same script
+    void scriptVars(const Entity& e) {
+        const Asset* a = assets.find(e.script);
+        if (!a) {
+            ImGui::TextColored(col(UI::error), "Script file not found");
+            return;
+        }
+        const ScriptInfo& info = scripting.info(assets.folder(), e.script, a->stamp);
+        if (!info.error.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, col(UI::error));
+            ImGui::TextWrapped("%s", info.error.c_str());
+            ImGui::PopStyleColor();
+            return;
+        }
+
+        for (const Var& def : info.defaults) {
+            Var cur = def;
+            if (const Var* v = findVar(e.vars, def.name); v && v->type == def.type) cur = *v;
+
+            bool changed = false;
+            ImGui::PushID(def.name.c_str());
+            if (def.type == 'n') {
+                changed = dragFloat(def.name.c_str(), &cur.number, 0.1f, 0, 0, "%g");
+            } else if (def.type == 'b') {
+                bool b = cur.number != 0;
+                if (ImGui::Checkbox(def.name.c_str(), &b)) { cur.number = b ? 1.0f : 0.0f; changed = true; }
+            } else {
+                changed = ImGui::InputText(def.name.c_str(), &cur.text);
+            }
+            ImGui::PopID();
+
+            if (changed)
+                forSelected([&](Entity& o) { if (o.script == e.script) setVar(o.vars, cur); });
+        }
+    }
+
+    // Position moves everyone by the same amount; every other field that changed is set on everyone
+    void syncOthers(const Entity& before, const Entity& e) {
+        if (scene.selection.size() < 2) return;
+        const bool tintChanged = !std::equal(std::begin(e.tint), std::end(e.tint), std::begin(before.tint));
+        forOthers([&](Entity& o) {
+            o.x += e.x - before.x;
+            o.y += e.y - before.y;
+            if (e.rotation != before.rotation) o.rotation = e.rotation;
+            if (e.sx != before.sx)             o.sx = e.sx;
+            if (e.sy != before.sy)             o.sy = e.sy;
+            if (e.visible != before.visible)   o.visible = e.visible;
+            if (e.sprite != before.sprite)     o.sprite = e.sprite;
+            if (e.flipX != before.flipX)       o.flipX = e.flipX;
+            if (e.flipY != before.flipY)       o.flipY = e.flipY;
+            if (e.front != before.front)       o.front = e.front;
+            if (e.zIndex != before.zIndex)     o.zIndex = e.zIndex;
+            if (tintChanged)                   std::copy(std::begin(e.tint), std::end(e.tint), std::begin(o.tint));
+            if (e.script != before.script)     { o.script = e.script; o.vars.clear(); }
+        });
+    }
+
     void inspector(float x, float y, float w, float h) {
         if (panel("Inspector", x, y, w, h)) {
             if (scene.hasSelection()) {
-                Entity& e = scene.entities[scene.active];
+                Entity&      e = scene.entities[scene.active];
+                const Entity before = e;
 
                 if (scene.selection.size() > 1) ImGui::TextDisabled("%d objects selected", int(scene.selection.size()));
                 else                            ImGui::InputText("Name", &e.name);
 
-                // Position moves everyone by the same amount; the rest is set on everyone
-                const float px = e.x, py = e.y;
-                if (dragFloat2("Position", &e.x))
-                    forOthers([&](Entity& o) { o.x += e.x - px; o.y += e.y - py; });
-                if (dragFloat("Rotation", &e.rotation))
-                    forOthers([&](Entity& o) { o.rotation = e.rotation; });
+                if (ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen))
+                    transformFields(e);
 
-                // Scale, with a lock that keeps X and Y equal
-                if (iconButton("scaleLock", scaleLocked ? Icon::Lock : Icon::Unlock, scaleLocked, true,
-                               scaleLocked ? "X and Y change together" : "Click to link X and Y")) {
-                    scaleLocked = !scaleLocked;
-                    if (scaleLocked) forSelected([](Entity& o) { o.sy = o.sx; });
-                }
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(ImGui::CalcItemWidth() - ImGui::GetFrameHeight() - ImGui::GetStyle().ItemSpacing.x);
-                const float ox = e.sx, oy = e.sy;
-                if (dragFloat2("Scale", &e.sx, 0.02f, 0.05f, 50.0f, "%.2f")) {
-                    if (scaleLocked) {
-                        if (e.sx != ox) e.sy = e.sx;
-                        else            e.sx = e.sy;
-                    }
-                    forOthers([&](Entity& o) { o.sx = e.sx; o.sy = e.sy; });
+                if (ImGui::CollapsingHeader("Sprite Renderer", ImGuiTreeNodeFlags_DefaultOpen))
+                    rendererFields(e);
+
+                if (ImGui::CollapsingHeader("Script##section", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    assetField("Script##file", e.script, true);
+                    if (e.script != before.script) e.vars.clear();   // the old values belong to the old script
+                    if (!e.script.empty()) scriptVars(e);
                 }
 
-                if (assetField("Sprite", e.sprite, false))
-                    forOthers([&](Entity& o) { o.sprite = e.sprite; });
-                if (assetField("Script", e.script, true))
-                    forOthers([&](Entity& o) { o.script = e.script; });
+                syncOthers(before, e);
 
                 ImGui::Separator();
                 ImGui::BeginDisabled(!editing());
