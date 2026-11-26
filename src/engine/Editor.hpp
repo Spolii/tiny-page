@@ -20,6 +20,10 @@
 #include "core/Log.hpp"
 #include "core/UI.hpp"
 #include "core/Window.hpp"
+#include <cstring>
+#include <mutex>
+#include "Project.hpp"
+#include "SceneFile.hpp"
 
 // The main window: menu bar, Hierarchy, Scene, Inspector and a bottom Console/Assets panel.
 // Create it after its Window and destroy it before the Window.
@@ -41,15 +45,11 @@ public:
         logIcons[1] = loadTexture(r, "warning.png");
         logIcons[2] = loadTexture(r, "error.png");
 
-        // Demo objects, for whichever of these assets exist in project/assets
+        // Open the project used last time (the repo's project folder the very first time)
         scene.assets = &assets;
-        const struct { const char* name; const char* sprite; float x, y; } demo[] = {
-            {"Icon", "icon.png", 48, 48}, {"Info", "info.png", 128, 68},
-            {"Warning", "warning.png", 208, 98}, {"Error", "error.png", 128, 138},
-        };
-        for (const auto& d : demo)
-            if (assets.find(d.sprite)) scene.add(d.name, d.x, d.y, d.sprite);
-        scene.resetHistory();
+        const fs::path start = startupProject();
+        if (!Project::exists(start)) Project::create(start);
+        openProject(start);
     }
 
     ~Editor() {
@@ -65,8 +65,30 @@ public:
         if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED) refreshAssets = true;
     }
 
+    // Closing the window, File > Exit, Alt+F4: asks first when there are unsaved changes
+    void requestQuit() {
+        stop();   // leave Play first, so unsaved edits are not hidden by it
+        guard(After::Quit);
+    }
+
     void frame() {
+        // A folder was chosen in the New / Open Project dialog
+        std::string folder;
+        {
+            std::lock_guard<std::mutex> lock(pickMutex);
+            folder.swap(pickedFolder);
+        }
+        if (!folder.empty()) guard(pickForNew ? After::NewProject : After::OpenProject, folder);
+
         // Safe moment to change textures: nothing from this frame references them yet
+        if (!projectToCreate.empty()) {
+            createProject(projectToCreate);
+            projectToCreate.clear();
+        }
+        if (!projectToOpen.empty()) {
+            openProject(projectToOpen);
+            projectToOpen.clear();
+        }
         if (!deleteAsset.empty()) {
             assets.remove(deleteAsset);
             deleteAsset.clear();
@@ -78,6 +100,8 @@ public:
             refreshAssets = false;
         }
 
+        updateTitle();
+
         // Run the scripts
         const Uint64 now = SDL_GetTicksNS();
         const float  dt  = lastTicks ? std::min(float(now - lastTicks) / 1e9f, 0.1f) : 0.0f;
@@ -88,8 +112,8 @@ public:
         assetsFocused     = false;
 
         // 1. Build the UI
-        ImGui_ImplSDLRenderer3_NewFrame();
         ImGui_ImplSDL3_NewFrame();
+        ImGui_ImplSDLRenderer3_NewFrame();
         ImGui::NewFrame();
 
         shortcuts();
@@ -107,6 +131,8 @@ public:
         inspector(left + midW, top, right, midH);
         bottomPanel(0, top + midH, d.x, bottom);
         deleteAssetDialog();
+        saveAsDialog();    // before unsavedDialog(): that one may ask for this one to open
+        unsavedDialog();
 
         // One finished drag / rename / action = one undo step (not recorded while playing)
         if (!ImGui::IsAnyItemActive()) scene.commitIfChanged();
@@ -131,6 +157,7 @@ private:
     enum class Mode { Stopped, Playing, Paused };
     enum class Drag { None, Move, Marquee };
     enum class Icon { Play, Pause, Stop, Lock, Unlock };
+    enum class After { None, NewScene, OpenScene, OpenProject, NewProject, Quit };   // what to do once unsaved changes are dealt with
 
     static constexpr int viewW = 320, viewH = 180;   // scene size in scene units
 
@@ -362,6 +389,12 @@ private:
         if (io.WantTextInput ||
             ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) return;
 
+        if (editing() && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
+            if (io.KeyShift) openSaveAs = true;
+            else             saveScene();
+        }
+        if (editing() && io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_N, false)) guard(After::NewScene);
+
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Z)) io.KeyShift ? redo() : undo();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_Y)) redo();
         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_D, false)) duplicateSelected();
@@ -377,7 +410,27 @@ private:
         if (!ImGui::BeginMainMenuBar()) return;
 
         if (ImGui::BeginMenu("File")) {
-            if (ImGui::MenuItem("Exit")) wantsQuit = true;
+            ImGui::TextDisabled("Project: %s", project.name.c_str());
+            ImGui::Separator();
+
+            ImGui::BeginDisabled(!editing());
+            if (ImGui::MenuItem("New Scene", "Ctrl+N")) guard(After::NewScene);
+            if (ImGui::BeginMenu("Open Scene")) {
+                const std::vector<std::string> names = project.scenes();
+                if (names.empty()) ImGui::TextDisabled("No saved scenes yet");
+                for (const std::string& n : names)
+                    if (ImGui::MenuItem(n.c_str(), nullptr, n == project.scene)) guard(After::OpenScene, n);
+                ImGui::EndMenu();
+            }
+            if (ImGui::MenuItem("Save Scene", "Ctrl+S")) saveScene();
+            if (ImGui::MenuItem("Save Scene As...", "Ctrl+Shift+S")) openSaveAs = true;
+            ImGui::Separator();
+            if (ImGui::MenuItem("New Project..."))  pickFolder(true);
+            if (ImGui::MenuItem("Open Project...")) pickFolder(false);
+            ImGui::EndDisabled();
+
+            ImGui::Separator();
+            if (ImGui::MenuItem("Exit")) requestQuit();
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Edit")) {
@@ -887,6 +940,246 @@ private:
         }
     }
 
+    // ---- projects and scenes ----
+    bool dirty() const { return !scene.isPlaying() && scene.entities != savedEntities; }
+
+    static std::string lastProjectFile() { return std::string(SDL_GetBasePath()) + "last_project.txt"; }
+
+    // The project used last time, or the repo's own project folder the very first time
+    fs::path startupProject() {
+        size_t size = 0;
+        char*  data = static_cast<char*>(SDL_LoadFile(lastProjectFile().c_str(), &size));
+        if (data) {
+            const fs::path p{std::string(data, size)};
+            SDL_free(data);
+            if (Project::exists(p)) return p;
+        }
+        return PROJECT_DIR;
+    }
+
+    void rememberProject() {
+        const std::string path = project.root.string();
+        SDL_SaveFile(lastProjectFile().c_str(), path.data(), path.size());
+    }
+
+    // Four demo objects, for whichever of these assets the project has
+    void seedDemo() {
+        const struct { const char* name; const char* sprite; float x, y; } demo[] = {
+            {"Icon", "icon.png", 48, 48}, {"Info", "info.png", 128, 68},
+            {"Warning", "warning.png", 208, 98}, {"Error", "error.png", 128, 138},
+        };
+        for (const auto& d : demo)
+            if (assets.find(d.sprite)) scene.add(d.name, d.x, d.y, d.sprite);
+        scene.resetHistory();
+        savedEntities = scene.entities;
+    }
+
+    void newScene() {
+        scene.entities.clear();
+        scene.select(-1);
+        scene.resetHistory();
+        savedEntities = scene.entities;
+        project.scene.clear();
+        renaming = -1;
+        anchor   = -1;
+    }
+
+    bool openScene(const std::string& name) {
+        std::vector<Entity> loaded;
+        const std::string   error = SceneFile::load(project.scenePath(name), loaded);
+        if (!error.empty()) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Could not open scene %s: %s", name.c_str(), error.c_str());
+            return false;
+        }
+        scene.entities = std::move(loaded);
+        scene.select(-1);
+        scene.resetHistory();
+        savedEntities = scene.entities;
+        project.scene = name;
+        project.saveInfo();
+        renaming = -1;
+        anchor   = -1;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Opened scene %s", name.c_str());
+        return true;
+    }
+
+    void writeScene(const std::string& name) {
+        if (!SceneFile::save(project.scenePath(name), scene.entities)) {
+            SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "Could not save scene %s", name.c_str());
+            return;
+        }
+        project.scene = name;
+        project.saveInfo();
+        savedEntities = scene.entities;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Saved scene %s", name.c_str());
+    }
+
+    // A scene that has no name yet asks for one first
+    void saveScene() {
+        if (!editing()) return;
+        if (project.scene.empty()) openSaveAs = true;
+        else                       writeScene(project.scene);
+    }
+
+    void openProject(const fs::path& folder) {
+        stop();
+        if (!Project::exists(folder)) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Not a tiny-page project (no project.lua): %s",
+                        folder.string().c_str());
+            return;
+        }
+        Project opened;
+        if (!opened.open(folder)) return;
+
+        project = opened;
+        assets.setRoot(project.root);
+        rememberProject();
+        renaming = -1;
+        anchor   = -1;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Opened project %s", project.name.c_str());
+
+        std::error_code ec;
+        const bool hasScene = !project.scene.empty() && fs::exists(project.scenePath(project.scene), ec);
+        if (!hasScene || !openScene(project.scene)) {
+            newScene();
+            seedDemo();
+        }
+    }
+
+    void createProject(const fs::path& folder) {
+        if (!Project::exists(folder) && !Project::create(folder)) return;
+        openProject(folder);
+    }
+
+    // The Windows folder dialog answers later, from another thread (see folderPicked and frame())
+    void pickFolder(bool forNewProject) {
+        pickForNew = forNewProject;
+        SDL_ShowOpenFolderDialog(folderPicked, this, win.window, nullptr, false);
+    }
+
+    static void SDLCALL folderPicked(void* userdata, const char* const* list, int) {
+        if (!list || !list[0]) return;   // cancelled
+        auto* self = static_cast<Editor*>(userdata);
+        std::lock_guard<std::mutex> lock(self->pickMutex);
+        self->pickedFolder = list[0];
+    }
+
+    // Do `what` now, or first ask about unsaved changes
+    void guard(After what, std::string arg = {}) {
+        if (!dirty()) {
+            run(what, arg);
+            return;
+        }
+        pending    = what;
+        pendingArg = std::move(arg);
+        openUnsaved = true;
+    }
+
+    void run(After what, const std::string& arg) {
+        switch (what) {
+        case After::NewScene:    newScene(); break;
+        case After::OpenScene:   openScene(arg); break;
+        case After::OpenProject: projectToOpen   = arg; break;   // changes textures: done at the start of the next frame
+        case After::NewProject:  projectToCreate = arg; break;
+        case After::Quit:        wantsQuit = true; break;
+        case After::None:        break;
+        }
+    }
+
+    void runPending() {
+        const After       what = pending;
+        const std::string arg  = pendingArg;
+        pending = After::None;
+        run(what, arg);
+    }
+
+    void updateTitle() {
+        const std::string t = "tiny-page - " + project.name + " - " +
+                              (project.scene.empty() ? "Untitled" : project.scene) + (dirty() ? "*" : "");
+        if (t == title) return;
+        title = t;
+        SDL_SetWindowTitle(win.window, title.c_str());
+    }
+
+    // Letters, digits and spaces are fine; anything a file name cannot contain is dropped
+    static std::string cleanName(std::string s) {
+        s.erase(std::remove_if(s.begin(), s.end(),
+                               [](unsigned char c) { return c < 32 || std::strchr("\\/:*?\"<>|", c); }),
+                s.end());
+        const size_t a = s.find_first_not_of(' ');
+        const size_t b = s.find_last_not_of(' ');
+        return a == std::string::npos ? std::string{} : s.substr(a, b - a + 1);
+    }
+
+    void unsavedDialog() {
+        if (openUnsaved) {
+            ImGui::OpenPopup("Unsaved changes");
+            openUnsaved = false;
+        }
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {0.5f, 0.5f});
+        if (ImGui::BeginPopupModal("Unsaved changes", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+            const std::string name = project.scene.empty() ? "the untitled scene" : "\"" + project.scene + "\"";
+            ImGui::Text("Save changes to %s?", name.c_str());
+            ImGui::Spacing();
+            if (ImGui::Button("Save", {110, 0})) {
+                ImGui::CloseCurrentPopup();
+                if (project.scene.empty()) {
+                    openSaveAs = true;   // asks for a name, then carries on with what was pending
+                } else {
+                    writeScene(project.scene);
+                    runPending();
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Don't Save", {110, 0})) {
+                ImGui::CloseCurrentPopup();
+                runPending();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", {110, 0}) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                ImGui::CloseCurrentPopup();
+                pending = After::None;
+            }
+            ImGui::EndPopup();
+        }
+    }
+
+    void saveAsDialog() {
+        if (openSaveAs) {
+            saveAsName  = project.scene.empty() ? "Main" : project.scene;
+            saveAsFocus = true;
+            ImGui::OpenPopup("Save scene as");
+            openSaveAs = false;
+        }
+        ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Appearing, {0.5f, 0.5f});
+        if (ImGui::BeginPopupModal("Save scene as", nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+            if (saveAsFocus) { ImGui::SetKeyboardFocusHere(); saveAsFocus = false; }
+            const bool enter = ImGui::InputText("Name", &saveAsName, ImGuiInputTextFlags_EnterReturnsTrue);
+
+            const std::string clean = cleanName(saveAsName);
+            std::error_code   ec;
+            if (!clean.empty() && fs::exists(project.scenePath(clean), ec))
+                ImGui::TextDisabled("A scene with this name exists and will be replaced.");
+            ImGui::Spacing();
+
+            ImGui::BeginDisabled(clean.empty());
+            if (ImGui::Button("Save", {110, 0}) || (enter && !clean.empty())) {
+                writeScene(clean);
+                ImGui::CloseCurrentPopup();
+                runPending();
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", {110, 0}) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                ImGui::CloseCurrentPopup();
+                pending = After::None;
+            }
+            ImGui::EndPopup();
+        }
+    }
+
     Window&       win;
     SDL_Renderer* r;
     AssetStore    assets;
@@ -920,4 +1213,17 @@ private:
     std::string askDelete, deleteAsset;
     bool        openDeleteDialog = false;
     bool        assetsFocused = false, assetsFocusedLast = false;
+
+    // Project and scenes
+    Project             project;
+    std::vector<Entity> savedEntities;          // what is on disk, to tell if there are unsaved changes
+    After               pending = After::None;  // waiting for the "Save changes?" answer
+    std::string         pendingArg;
+    bool                openUnsaved = false, openSaveAs = false, saveAsFocus = false;
+    std::string         saveAsName;
+    std::string         projectToOpen, projectToCreate;   // applied at the start of the next frame
+    std::string         title;
+    std::mutex          pickMutex;              // the folder dialog answers from another thread
+    std::string         pickedFolder;
+    bool                pickForNew = false;
 };

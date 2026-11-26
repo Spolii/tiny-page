@@ -27,7 +27,7 @@ int main(int, char**) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             editor->handleEvent(e);
-            if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) running = false;
+            if (e.type == SDL_EVENT_QUIT || e.type == SDL_EVENT_WINDOW_CLOSE_REQUESTED) editor->requestQuit();
         }
         if (editor->wantsQuit) running = false;
         editor->frame();

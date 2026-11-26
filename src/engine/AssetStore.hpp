@@ -37,7 +37,19 @@ struct Asset {
 // Call refresh() only outside the UI build (it can replace textures).
 class AssetStore {
 public:
-    explicit AssetStore(SDL_Renderer* r) : renderer(r) {
+    explicit AssetStore(SDL_Renderer* r) : renderer(r) {}
+
+    ~AssetStore() {
+        for (Asset& a : assets) if (a.texture) SDL_DestroyTexture(a.texture);
+    }
+
+    // Switch to another project's assets (call outside the UI build: it replaces textures)
+    void setRoot(const fs::path& newRoot) {
+        for (Asset& a : assets) if (a.texture) SDL_DestroyTexture(a.texture);
+        assets.clear();
+        smoothNames.clear();
+        root = newRoot;
+
         std::error_code ec;
         fs::create_directories(dir(), ec);
         loadFilters();
@@ -186,8 +198,8 @@ private:
         "    self.rotation = self.rotation + 90 * dt\n"
         "end\n";
 
-    static fs::path dir()         { return fs::path(PROJECT_DIR) / "assets"; }
-    static fs::path filtersFile() { return fs::path(PROJECT_DIR) / "filters.txt"; }
+    fs::path dir() const         { return root / "assets"; }
+    fs::path filtersFile() const { return root / "filters.txt"; }
 
     static bool hasExt(const fs::path& p, const char* ext) {
         std::string e = p.extension().string();
@@ -221,6 +233,7 @@ private:
     }
 
     SDL_Renderer*         renderer;
+    fs::path              root;
     std::vector<Asset>    assets;
     std::set<std::string> smoothNames;
 };
