@@ -242,6 +242,7 @@ private:
         setBool("flip_y", e.flipY);
         setNumber("z_index", float(e.zIndex));
         setNumber("alpha", e.tint[3]);
+        setNumber("zoom", e.zoom);
         const SDL_FPoint look = Scene::look(e);
         setNumber("look_x", look.x);
         setNumber("look_y", look.y);
@@ -265,6 +266,7 @@ private:
             e.flipY    = getBool("flip_y", e.flipY);
             e.zIndex   = int(std::lround(getNumber("z_index", float(e.zIndex))));
             e.tint[3]  = std::clamp(getNumber("alpha", e.tint[3]), 0.0f, 1.0f);
+            e.zoom     = std::clamp(getNumber("zoom", e.zoom), 0.1f, 20.0f);
         } else {
             lua_pop(L, 1);
         }

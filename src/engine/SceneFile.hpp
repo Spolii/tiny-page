@@ -1,6 +1,7 @@
 #pragma once
 #include <algorithm>
 #include <filesystem>
+#include <iterator>
 #include <string>
 #include <vector>
 #include "LuaFile.hpp"
@@ -12,9 +13,29 @@ namespace SceneFile {
 
 inline const char* const fronts[4] = {"right", "up", "left", "down"};
 
+// { 1, 0.5, 0 }
+inline std::string floats(const float* v, int count) {
+    std::string out = "{ ";
+    for (int k = 0; k < count; ++k) out += lua_data::number(v[k]) + (k + 1 < count ? ", " : " ");
+    return out + "}";
+}
+
+// Reads a list of numbers stored under `key` in the table on top of the Lua stack
+inline void readFloats(lua_State* L, const char* key, float* dst, int count) {
+    lua_getfield(L, -1, key);
+    if (lua_istable(L, -1))
+        for (int k = 0; k < count; ++k) {
+            lua_rawgeti(L, -1, k + 1);
+            if (lua_isnumber(L, -1)) dst[k] = float(lua_tonumber(L, -1));
+            lua_pop(L, 1);
+        }
+    lua_pop(L, 1);
+}
+
 inline bool save(const std::filesystem::path& path, const std::vector<Entity>& entities) {
     using namespace lua_data;
-    std::string out = "-- tiny-page scene\nreturn {\n  entities = {\n";
+    const Entity base;   // the defaults, to leave out values nobody changed
+    std::string  out = "-- tiny-page scene\nreturn {\n  entities = {\n";
     for (const Entity& e : entities) {
         out += "    {\n";
         out += "      name = " + quote(e.name) + ",\n";
@@ -27,9 +48,14 @@ inline bool save(const std::filesystem::path& path, const std::vector<Entity>& e
         if (e.flipY)                out += "      flip_y = true,\n";
         if (e.front != 0)           out += std::string("      front = \"") + fronts[std::clamp(e.front, 0, 3)] + "\",\n";
         if (e.zIndex != 0)          out += "      z_index = " + std::to_string(e.zIndex) + ",\n";
-        if (!(e.tint[0] == 1 && e.tint[1] == 1 && e.tint[2] == 1 && e.tint[3] == 1))
-            out += "      tint = { " + number(e.tint[0]) + ", " + number(e.tint[1]) + ", " +
-                   number(e.tint[2]) + ", " + number(e.tint[3]) + " },\n";
+        if (!std::equal(std::begin(e.tint), std::end(e.tint), std::begin(base.tint)))
+            out += "      tint = " + floats(e.tint, 4) + ",\n";
+        if (e.camera) {
+            out += "      camera = true,\n";
+            if (e.zoom != 1) out += "      zoom = " + number(e.zoom) + ",\n";
+            if (!std::equal(std::begin(e.background), std::end(e.background), std::begin(base.background)))
+                out += "      background = " + floats(e.background, 3) + ",\n";
+        }
         if (!e.script.empty())      out += "      script = " + quote(e.script) + ",\n";
         if (!e.vars.empty()) {
             out += "      vars = { ";
@@ -66,20 +92,15 @@ inline Entity readEntity(lua_State* L) {
     e.flipX    = flag(L, "flip_x", false);
     e.flipY    = flag(L, "flip_y", false);
     e.zIndex   = int(num(L, "z_index", 0));
+    e.camera   = flag(L, "camera", false);
+    e.zoom     = num(L, "zoom", 1);
     e.script   = str(L, "script");
+    readFloats(L, "tint", e.tint, 4);
+    readFloats(L, "background", e.background, 3);
 
     const std::string front = str(L, "front", "right");
     e.front = 0;
     for (int i = 0; i < 4; ++i) if (front == fronts[i]) e.front = i;
-
-    lua_getfield(L, -1, "tint");
-    if (lua_istable(L, -1))
-        for (int k = 0; k < 4; ++k) {
-            lua_rawgeti(L, -1, k + 1);
-            if (lua_isnumber(L, -1)) e.tint[k] = float(lua_tonumber(L, -1));
-            lua_pop(L, 1);
-        }
-    lua_pop(L, 1);
 
     lua_getfield(L, -1, "vars");
     if (lua_istable(L, -1)) {

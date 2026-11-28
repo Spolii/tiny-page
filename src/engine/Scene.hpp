@@ -47,6 +47,11 @@ struct Entity {
     int         zIndex = 0;               // higher = drawn on top
     float       tint[4] = {1, 1, 1, 1};   // red, green, blue, alpha (0..1)
 
+    // Camera
+    bool  camera = false;                 // this object is a camera
+    float zoom   = 1;                     // 2 = twice as close
+    float background[3] = {24 / 255.0f, 24 / 255.0f, 34 / 255.0f};   // shown where nothing is drawn
+
     // Script
     std::string      script;              // asset name of a .lua file, empty = none
     std::vector<Var> vars;                // values of the script's public variables that were changed
@@ -55,6 +60,14 @@ struct Entity {
 };
 
 struct Scene {
+    // Where and how to draw the scene into a render target
+    struct Frame {
+        float scale  = 1;          // render pixels per world unit
+        float ox = 0, oy = 0;      // render position of world point (0, 0)
+        bool  editor = false;      // also draw editor-only things: placeholders, selection, arrows, camera frames
+        float viewW = 320, viewH = 180;   // the game screen in world units at zoom 1 (for camera frames)
+    };
+
     std::vector<Entity> entities;
     std::vector<int>    selection;   // indices into `entities`, ascending
     int                 active = -1; // the one the Inspector shows (always inside `selection`)
@@ -133,6 +146,13 @@ struct Scene {
         if (!created.empty()) setSelection(created, created.back());
     }
 
+    // The camera the Game view uses: the first camera in the list, or -1
+    int mainCamera() const {
+        for (int i = 0; i < int(entities.size()); ++i)
+            if (entities[i].camera) return i;
+        return -1;
+    }
+
     // Box in scene units, unrotated (position is the center)
     SDL_FRect bounds(const Entity& e) const {
         const SDL_FPoint s = assets ? assets->size(e.sprite) : SDL_FPoint{16, 16};
@@ -170,7 +190,7 @@ struct Scene {
     int pick(float x, float y) const {
         const std::vector<int> order = drawOrder();
         for (auto it = order.rbegin(); it != order.rend(); ++it) {
-            const Entity&   e = entities[*it];
+            const Entity& e = entities[*it];
             if (!e.visible) continue;
             const SDL_FRect  b = bounds(e);
             const SDL_FPoint p = rotate(x - (b.x + b.w / 2), y - (b.y + b.h / 2), -e.rotation);
@@ -198,12 +218,11 @@ struct Scene {
         return hits;
     }
 
-    // `scale` = render pixels per scene unit
-    void draw(SDL_Renderer* r, float scale) const {
+    void draw(SDL_Renderer* r, const Frame& f) const {
         for (int i : drawOrder()) {
             const Entity& e = entities[i];
             if (!e.visible) continue;
-            const SDL_FRect dst = toPixels(bounds(e), scale);
+            const SDL_FRect dst = toPixels(bounds(e), f);
             SDL_Texture* tex = assets ? assets->texture(e.sprite) : nullptr;
 
             if (tex) {
@@ -212,16 +231,21 @@ struct Scene {
                 SDL_RenderTextureRotated(r, tex, nullptr, &dst, e.rotation, nullptr, flipOf(e));
                 SDL_SetTextureColorModFloat(tex, 1, 1, 1);   // the Assets panel shares this texture
                 SDL_SetTextureAlphaModFloat(tex, 1);
-            } else {
+            } else if (f.editor) {
                 quad(r, dst, e.rotation, 0, e.sprite.empty() ? UI::dim : UI::error);   // no sprite / missing asset
             }
         }
+        if (!f.editor) return;
 
-        // Selection boxes and the front arrow go on top of everything
+        // Editor-only things go on top of everything
+        const int main = mainCamera();
+        for (int i = 0; i < int(entities.size()); ++i)
+            if (entities[i].camera) cameraFrame(r, entities[i], f, i == main);
+
         for (int i = 0; i < int(entities.size()); ++i) {
             if (!isSelected(i)) continue;
             const Entity&   e   = entities[i];
-            const SDL_FRect dst = toPixels(bounds(e), scale);
+            const SDL_FRect dst = toPixels(bounds(e), f);
             quad(r, dst, e.rotation, 1, UI::accent);
             quad(r, dst, e.rotation, 2, UI::accent);
             arrow(r, dst, look(e), UI::warn);
@@ -289,13 +313,20 @@ struct Scene {
 private:
     bool valid(int i) const { return i >= 0 && i < int(entities.size()); }
 
-    static SDL_FRect toPixels(const SDL_FRect& b, float scale) {
-        return {b.x * scale, b.y * scale, b.w * scale, b.h * scale};
+    static SDL_FRect toPixels(const SDL_FRect& b, const Frame& f) {
+        return {b.x * f.scale + f.ox, b.y * f.scale + f.oy, b.w * f.scale, b.h * f.scale};
     }
 
     static SDL_FlipMode flipOf(const Entity& e) {
         return static_cast<SDL_FlipMode>((e.flipX ? SDL_FLIP_HORIZONTAL : SDL_FLIP_NONE) |
                                          (e.flipY ? SDL_FLIP_VERTICAL : SDL_FLIP_NONE));
+    }
+
+    // What a camera sees: the game screen, made smaller by the zoom
+    static void cameraFrame(SDL_Renderer* r, const Entity& e, const Frame& f, bool isMain) {
+        const float w = f.viewW / e.zoom, h = f.viewH / e.zoom;
+        const SDL_FRect box{(e.x - w / 2) * f.scale + f.ox, (e.y - h / 2) * f.scale + f.oy, w * f.scale, h * f.scale};
+        UI::outline(r, box, isMain ? UI::fg : UI::dim);
     }
 
     // A rotated rectangle outline, `grow` pixels outside the box

@@ -8,24 +8,24 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iterator>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 #include "AssetStore.hpp"
+#include "Project.hpp"
 #include "Scene.hpp"
+#include "SceneFile.hpp"
 #include "Scripting.hpp"
 #include "core/Assets.hpp"
 #include "core/Log.hpp"
 #include "core/UI.hpp"
 #include "core/Window.hpp"
-#include <cstring>
-#include <mutex>
-#include "Project.hpp"
-#include "SceneFile.hpp"
 
-// The main window: menu bar, Hierarchy, Scene, Inspector and a bottom Console/Assets panel.
+// The main window: menu bar, Hierarchy, Scene/Game view, Inspector and a bottom Console/Assets panel.
 // Create it after its Window and destroy it before the Window.
 class Editor {
 public:
@@ -110,10 +110,11 @@ public:
 
         assetsFocusedLast = assetsFocused;   // so Delete knows what you clicked last
         assetsFocused     = false;
+        sceneShown = gameShown = false;      // set again by the tab that is visible
 
         // 1. Build the UI
-        ImGui_ImplSDL3_NewFrame();
         ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
         ImGui::NewFrame();
 
         shortcuts();
@@ -127,7 +128,7 @@ public:
         const float  midH   = d.y - top - bottom;
 
         hierarchy(0, top, left, midH);
-        sceneView(left, top, midW, midH);
+        viewPanel(left, top, midW, midH);
         inspector(left + midW, top, right, midH);
         bottomPanel(0, top + midH, d.x, bottom);
         deleteAssetDialog();
@@ -139,13 +140,19 @@ public:
 
         ImGui::Render();
 
-        // 2. Draw the scene at the size it is shown (after the UI, so edits show immediately)
-        if (view) {
+        // 2. Draw whichever of the two views is visible (after the UI, so edits show immediately)
+        if (sceneShown && view) {
+            Scene::Frame f;
+            f.scale  = float(viewScale);
+            f.editor = true;
+            f.viewW  = viewW;
+            f.viewH  = viewH;
             SDL_SetRenderTarget(r, view);
             UI::clear(r, {24, 24, 34, 255});
-            scene.draw(r, float(viewScale));
+            scene.draw(r, f);
             SDL_SetRenderTarget(r, nullptr);
         }
+        if (gameShown && gameTex) drawGame();
 
         // 3. Draw the UI on top
         UI::clear(r, UI::bg);
@@ -159,7 +166,7 @@ private:
     enum class Icon { Play, Pause, Stop, Lock, Unlock };
     enum class After { None, NewScene, OpenScene, OpenProject, NewProject, Quit };   // what to do once unsaved changes are dealt with
 
-    static constexpr int viewW = 320, viewH = 180;   // scene size in scene units
+    static constexpr int viewW = 320, viewH = 180;   // the game screen in scene units (at zoom 1)
 
     // Context menus: a popup's mouse button is part of its flags and 0 means LEFT,
     // so every menu names the right button explicitly.
@@ -304,13 +311,59 @@ private:
         c[ImGuiCol_DragDropTarget]       = col(UI::accent);
     }
 
-    // The scene texture is viewW*s by viewH*s pixels, so it is shown 1:1 (no resampling)
-    void ensureView(int s) {
-        if (view && s == viewScale) return;
-        if (view) SDL_DestroyTexture(view);
-        view = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, viewW * s, viewH * s);
-        SDL_SetTextureScaleMode(view, SDL_SCALEMODE_NEAREST);
-        viewScale = s;
+    // ---- the two views (Scene and Game) ----
+    // A render target is viewW*s by viewH*s pixels, so it is shown 1:1 (no resampling)
+    void ensureTarget(SDL_Texture*& tex, int& current, int s) {
+        if (tex && s == current) return;
+        if (tex) SDL_DestroyTexture(tex);
+        tex = SDL_CreateTexture(r, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_TARGET, viewW * s, viewH * s);
+        SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+        current = s;
+    }
+
+    // The biggest whole-number zoom that fits the free space
+    static int fitScale(ImVec2 avail) {
+        return std::max(1, int(std::min(avail.x / viewW, avail.y / viewH)));
+    }
+
+    // Shows a render target centered in the free space; returns where it starts on screen
+    ImVec2 showTarget(SDL_Texture* tex, int s, ImVec2 avail) {
+        const ImVec2 size(float(viewW * s), float(viewH * s));
+        const ImVec2 pos = ImGui::GetCursorPos();
+        ImGui::SetCursorPos({pos.x + std::max(0.f, (avail.x - size.x) / 2),
+                             pos.y + std::max(0.f, (avail.y - size.y) / 2)});
+
+        const ImVec2 origin = ImGui::GetCursorScreenPos();
+        ImGui::Image(tid(tex), size);
+        if (mode != Mode::Stopped)   // a colored frame while playing / paused
+            ImGui::GetWindowDrawList()->AddRect(origin, {origin.x + size.x, origin.y + size.y},
+                ImGui::GetColorU32(col(mode == Mode::Paused ? UI::warn : UI::accent)), 0.0f, 0, 3.0f);
+        return origin;
+    }
+
+    // What the player sees: the world as the main camera looks at it
+    void drawGame() {
+        float     cx = viewW / 2.0f, cy = viewH / 2.0f, zoom = 1;
+        SDL_Color bg{24, 24, 34, 255};
+        const int cam = scene.mainCamera();
+        if (cam >= 0) {
+            const Entity& c = scene.entities[cam];
+            cx   = c.x;
+            cy   = c.y;
+            zoom = c.zoom;
+            bg   = {Uint8(c.background[0] * 255 + 0.5f), Uint8(c.background[1] * 255 + 0.5f),
+                    Uint8(c.background[2] * 255 + 0.5f), 255};
+        }
+
+        Scene::Frame f;
+        f.scale = gameScale * zoom;
+        f.ox    = viewW * gameScale / 2.0f - cx * f.scale;   // the camera's position ends up in the middle
+        f.oy    = viewH * gameScale / 2.0f - cy * f.scale;
+
+        SDL_SetRenderTarget(r, gameTex);
+        UI::clear(r, bg);
+        scene.draw(r, f);
+        SDL_SetRenderTarget(r, nullptr);
     }
 
     // ---- play mode ----
@@ -321,8 +374,9 @@ private:
         if (mode == Mode::Paused) { mode = Mode::Playing; return; }
         if (mode != Mode::Stopped) return;
         scene.beginPlay();
-        mode     = Mode::Playing;
-        renaming = -1;
+        mode          = Mode::Playing;
+        renaming      = -1;
+        selectGameTab = true;
         scripting.start(scene, assets.folder());
     }
 
@@ -335,8 +389,9 @@ private:
         if (mode == Mode::Stopped) return;
         scripting.stop();
         scene.endPlay();
-        mode     = Mode::Stopped;
-        renaming = -1;
+        mode           = Mode::Stopped;
+        renaming       = -1;
+        selectSceneTab = true;
     }
 
     // ---- actions (shared by shortcuts, menu bar and right-click menus) ----
@@ -365,6 +420,13 @@ private:
     }
 
     void addObjectAtCenter(const std::string& sprite = {}) { addObject(viewW / 2.0f, viewH / 2.0f, sprite); }
+
+    void addCamera() {
+        if (!editing()) return;
+        scene.add("Camera", viewW / 2.0f, viewH / 2.0f, "");
+        scene.entities.back().camera = true;
+        scene.select(int(scene.entities.size()) - 1);
+    }
 
     template <class F> void forSelected(F fn) {
         for (int i : scene.selection) fn(scene.entities[i]);
@@ -444,6 +506,7 @@ private:
         }
         if (ImGui::BeginMenu("Scene")) {
             if (ImGui::MenuItem("Add Object", nullptr, false, editing())) addObjectAtCenter();
+            if (ImGui::MenuItem("Add Camera", nullptr, false, editing())) addCamera();
             ImGui::EndMenu();
         }
         if (ImGui::BeginMenu("Debug")) {
@@ -499,13 +562,14 @@ private:
 
             if (ImGui::BeginPopupContextWindow("hierarchyMenu", rightClickEmpty)) {
                 if (ImGui::MenuItem("Add Object", nullptr, false, editing())) addObjectAtCenter();
+                if (ImGui::MenuItem("Add Camera", nullptr, false, editing())) addCamera();
                 ImGui::EndPopup();
             }
         }
         ImGui::End();
     }
 
-    // Play / Pause / Stop, centered at the top of the Scene panel
+    // Play / Pause / Stop, centered at the top of the view panel
     void toolbar() {
         const float s   = ImGui::GetFrameHeight();
         const float gap = ImGui::GetStyle().ItemSpacing.x;
@@ -518,32 +582,52 @@ private:
         if (iconButton("stop", Icon::Stop, false, mode != Mode::Stopped, "Stop")) stop();
     }
 
-    void sceneView(float x, float y, float w, float h) {
-        if (panel("Scene", x, y, w, h, ImGuiWindowFlags_NoScrollbar)) {
+    // The center panel: Play controls and two tabs, Scene (to edit) and Game (what the camera sees)
+    void viewPanel(float x, float y, float w, float h) {
+        if (panel("View", x, y, w, h, ImGuiWindowFlags_NoScrollbar)) {
             toolbar();
+            if (ImGui::BeginTabBar("views")) {
+                const ImGuiTabItemFlags pickScene = selectSceneTab ? ImGuiTabItemFlags_SetSelected : 0;
+                const ImGuiTabItemFlags pickGame  = selectGameTab  ? ImGuiTabItemFlags_SetSelected : 0;
+                selectSceneTab = selectGameTab = false;
 
-            const ImVec2 avail = ImGui::GetContentRegionAvail();
-            const int    s     = std::max(1, int(std::min(avail.x / viewW, avail.y / viewH)));
-            ensureView(s);
-
-            const ImVec2 size(float(viewW * s), float(viewH * s));
-            const ImVec2 pos = ImGui::GetCursorPos();
-            ImGui::SetCursorPos({pos.x + std::max(0.f, (avail.x - size.x) / 2),
-                                 pos.y + std::max(0.f, (avail.y - size.y) / 2)});
-
-            const ImVec2 origin = ImGui::GetCursorScreenPos();
-            ImGui::Image(tid(view), size);
-            if (mode != Mode::Stopped)   // a colored frame while playing / paused
-                ImGui::GetWindowDrawList()->AddRect(origin, {origin.x + size.x, origin.y + size.y},
-                    ImGui::GetColorU32(col(mode == Mode::Paused ? UI::warn : UI::accent)), 0.0f, 0, 3.0f);
-
-            ImGui::SetCursorScreenPos(origin);
-            ImGui::InvisibleButton("viewport", size);
-            dragInScene(origin, float(s));
-            sceneDrop(origin, float(s));
-            sceneMenu(origin, float(s));
+                if (ImGui::BeginTabItem("Scene", nullptr, pickScene)) {
+                    sceneView();
+                    ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem("Game", nullptr, pickGame)) {
+                    gameView();
+                    ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+            }
         }
         ImGui::End();
+    }
+
+    void sceneView() {
+        sceneShown = true;
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const int    s     = fitScale(avail);
+        ensureTarget(view, viewScale, s);
+
+        const ImVec2 origin = showTarget(view, s, avail);
+        ImGui::SetCursorScreenPos(origin);
+        ImGui::InvisibleButton("viewport", {float(viewW * s), float(viewH * s)});
+        dragInScene(origin, float(s));
+        sceneDrop(origin, float(s));
+        sceneMenu(origin, float(s));
+    }
+
+    void gameView() {
+        gameShown = true;
+        if (scene.mainCamera() < 0)
+            ImGui::TextDisabled("No camera in the scene: showing the default view. Use Scene > Add Camera.");
+
+        const ImVec2 avail = ImGui::GetContentRegionAvail();
+        const int    s     = fitScale(avail);
+        ensureTarget(gameTex, gameScale, s);
+        showTarget(gameTex, s, avail);
     }
 
     // Click to select (Ctrl/Shift adds), drag a selected object to move the selection,
@@ -627,8 +711,12 @@ private:
             else                             scene.active = hit;
         }
         if (ImGui::BeginPopupContextItem("sceneMenu", rightClick)) {
-            if (scene.hasSelection()) entityMenu();
-            else if (ImGui::MenuItem("Add Object", nullptr, false, editing())) addObject(clickX, clickY);
+            if (scene.hasSelection()) {
+                entityMenu();
+            } else {
+                if (ImGui::MenuItem("Add Object", nullptr, false, editing())) addObject(clickX, clickY);
+                if (ImGui::MenuItem("Add Camera", nullptr, false, editing())) addCamera();
+            }
             ImGui::EndPopup();
         }
     }
@@ -694,6 +782,18 @@ private:
         ImGui::ColorEdit4("Tint", e.tint, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_AlphaPreviewHalf);
     }
 
+    void cameraFields(Entity& e) {
+        ImGui::Checkbox("Is Camera", &e.camera);
+        if (!e.camera) return;
+
+        dragFloat("Zoom", &e.zoom, 0.02f, 0.1f, 20.0f, "%.2f");
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("2 = twice as close. Scripts can change it with self.zoom.");
+        ImGui::ColorEdit3("Background", e.background, ImGuiColorEditFlags_NoInputs);
+
+        if (scene.mainCamera() != scene.active)
+            ImGui::TextDisabled("Not used: the first camera in the\nHierarchy is the main one.");
+    }
+
     // The script's public variables: one field each, set on every selected object that uses the same script
     void scriptVars(const Entity& e) {
         const Asset* a = assets.find(e.script);
@@ -734,6 +834,7 @@ private:
     void syncOthers(const Entity& before, const Entity& e) {
         if (scene.selection.size() < 2) return;
         const bool tintChanged = !std::equal(std::begin(e.tint), std::end(e.tint), std::begin(before.tint));
+        const bool backChanged = !std::equal(std::begin(e.background), std::end(e.background), std::begin(before.background));
         forOthers([&](Entity& o) {
             o.x += e.x - before.x;
             o.y += e.y - before.y;
@@ -747,6 +848,9 @@ private:
             if (e.front != before.front)       o.front = e.front;
             if (e.zIndex != before.zIndex)     o.zIndex = e.zIndex;
             if (tintChanged)                   std::copy(std::begin(e.tint), std::end(e.tint), std::begin(o.tint));
+            if (e.camera != before.camera)     o.camera = e.camera;
+            if (e.zoom != before.zoom)         o.zoom = e.zoom;
+            if (backChanged)                   std::copy(std::begin(e.background), std::end(e.background), std::begin(o.background));
             if (e.script != before.script)     { o.script = e.script; o.vars.clear(); }
         });
     }
@@ -766,7 +870,11 @@ private:
                 if (ImGui::CollapsingHeader("Sprite Renderer", ImGuiTreeNodeFlags_DefaultOpen))
                     rendererFields(e);
 
+                if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen))
+                    cameraFields(e);
+
                 if (ImGui::CollapsingHeader("Script##section", ImGuiTreeNodeFlags_DefaultOpen)) {
+                    // "##file" keeps this dropdown's ID different from the "Script" header above
                     assetField("Script##file", e.script, true);
                     if (e.script != before.script) e.vars.clear();   // the old values belong to the old script
                     if (!e.script.empty()) scriptVars(e);
@@ -1070,8 +1178,8 @@ private:
             run(what, arg);
             return;
         }
-        pending    = what;
-        pendingArg = std::move(arg);
+        pending     = what;
+        pendingArg  = std::move(arg);
         openUnsaved = true;
     }
 
@@ -1183,8 +1291,12 @@ private:
     Window&       win;
     SDL_Renderer* r;
     AssetStore    assets;
-    SDL_Texture*  view        = nullptr;
+    SDL_Texture*  view        = nullptr;   // the Scene tab
     int           viewScale   = 0;
+    SDL_Texture*  gameTex     = nullptr;   // the Game tab
+    int           gameScale   = 0;
+    bool          sceneShown = false, gameShown = false;          // which tab is visible this frame
+    bool          selectSceneTab = false, selectGameTab = false;  // switch tab on the next frame
     SDL_Texture*  logIcons[3] = {};
     Scene         scene;
     Scripting     scripting;
